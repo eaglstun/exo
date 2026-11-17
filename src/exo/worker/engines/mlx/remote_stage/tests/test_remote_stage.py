@@ -28,6 +28,7 @@ from exo.shared.types.text_generation import (
 )
 from exo.shared.types.worker.runner_response import GenerationResponse
 from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt
+from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import mlx_generate
 from exo.worker.engines.mlx.remote_stage.client import (
     RemoteStageLink,
@@ -279,6 +280,74 @@ def test_remote_stage_generates_what_the_whole_model_does(
 
     # Every cache the node dropped is gone from the stage too
     del whole_prefix_cache, staged_prefix_cache
+    gc.collect()
+    mx.clear_cache()
+    assert link.live_caches() == 0
+
+
+def _generate_batched(
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    schedule: list[tuple[int, TextGenerationTaskParams]],
+) -> list[list[int]]:
+    """Each task's tokens, generated together by exo's batch generator; a task joins the
+    batch at its step"""
+    generator = ExoBatchGenerator(
+        model=model,
+        tokenizer=tokenizer,
+        group=None,
+        kv_prefix_cache=KVPrefixCache(None),
+    )
+    tokens: dict[int, list[int]] = {}
+    order: list[int] = []
+    step = 0
+    pending = sorted(schedule, key=lambda item: item[0])
+    while pending or generator.has_work:
+        while pending and pending[0][0] <= step:
+            _, task = pending.pop(0)
+            uid = generator.submit(task, apply_chat_template(tokenizer, task))
+            order.append(uid)
+            tokens[uid] = []
+        for uid, response in generator.step():
+            tokens[uid].append(response.token)
+        step += 1
+    generator.close()
+    return [tokens[uid] for uid in order]
+
+
+@pytest.mark.slow
+def test_remote_stage_generates_what_the_whole_model_does_in_a_batch(
+    model_path: Path, link: RemoteStageLink
+) -> None:
+    """Requests of different lengths join a running batch and leave it at different times:
+    the stage merges, extends, filters and extracts its batch caches as mlx-lm does"""
+    tokenizer = load_tokenizer_for_model_id(MODEL_ID, model_path)
+    whole, _ = load_model(model_path)
+    staged, _ = load_model(model_path)
+    config = cast(
+        dict[str, object], json.loads((model_path / "config.json").read_text())
+    )
+    attach_remote_stage(staged, link, START_LAYER, END_LAYER, config)  # pyright: ignore[reportArgumentType]
+    schedule = [
+        (0, _task("What is the capital of France?", max_tokens=12)),
+        (0, _task("Name three primary colors.", max_tokens=30)),
+        (3, _task("How many marbles are in box 12?", context=LONG_CONTEXT)),
+        (6, _task("Count from one to ten.", max_tokens=20)),
+        (6, _task("Which boxes hold amber marbles?", context=LONG_CONTEXT)),
+    ]
+
+    expected = _generate_batched(whole, tokenizer, schedule)  # pyright: ignore[reportArgumentType]
+    actual = _generate_batched(staged, tokenizer, schedule)  # pyright: ignore[reportArgumentType]
+
+    other_device = bool(os.environ.get("EXO_REMOTE_STAGE"))
+    for index, (want, got) in enumerate(zip(expected, actual, strict=True)):
+        print(f"request {index}: {len(got)} tokens, identical: {want == got}")
+        if not other_device:
+            assert got == want, f"request {index}: {tokenizer.decode(got)!r}"
+    if other_device:
+        # Another GPU may part from the whole model at a near-tie; most requests don't
+        assert sum(want == got for want, got in zip(expected, actual)) >= 3
+
     gc.collect()
     mx.clear_cache()
     assert link.live_caches() == 0

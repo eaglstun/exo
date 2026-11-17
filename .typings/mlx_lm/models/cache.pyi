@@ -299,21 +299,34 @@ class BatchKVCache(_BaseCache):
     @state.setter
     def state(self, v):  # -> None:
         ...
+    def prepare(
+        self,
+        *,
+        left_padding: List[int] | None = ...,
+        lengths: List[int] | None = ...,
+        right_padding: List[int] | None = ...,
+    ) -> None: ...
+    def finalize(self) -> None: ...
     def is_trimmable(self):  # -> Literal[True]:
         ...
-    def trim(self, n):  # -> int | float:
-        ...
+    def trim(self, n: int) -> int: ...
     def make_mask(self, N: int, return_array: bool = ..., **kwargs):  # -> array:
         ...
-    def filter(self, batch_indices):  # -> None:
+    def filter(self, batch_indices: List[int] | array) -> None:
         """
         In-place filter to keep just the given indices in the cache.
         """
 
-    def extend(self, other):  # -> None:
+    def extend(self, other: BatchKVCache) -> None:
         """
         In-place extend this cache with the other cache.
         """
+
+    def extract(self, idx: int) -> KVCache: ...
+    @classmethod
+    def merge(cls, caches: List[KVCache]) -> BatchKVCache: ...
+    def size(self) -> int: ...
+    def empty(self) -> bool: ...
 
 class BatchRotatingKVCache(_BaseCache):
     step: int

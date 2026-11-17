@@ -20,7 +20,7 @@ from pydantic import Field
 
 from exo.utils.pydantic_ext import FrozenModel
 
-PROTOCOL_VERSION: Final = 3
+PROTOCOL_VERSION: Final = 4
 
 Operation = Literal[
     # node -> stage
@@ -32,6 +32,14 @@ Operation = Literal[
     "copy",
     "free",
     "stats",
+    # Batches, as mlx-lm's BatchKVCache does them (see client.RemoteBatchKVCache)
+    "merge",
+    "extend",
+    "filter",
+    "extract",
+    "prepare",
+    "finalize",
+    "trim",
     # stage -> node
     "welcome",
     "loaded",
@@ -43,11 +51,19 @@ Operation = Literal[
 
 class Frame(FrozenModel):
     operation: Operation
-    # The cache this operation is for; for `copy`, the new cache
+    # The cache this operation is for; for `copy`, `merge` and `extract`, the new cache
     handle: int = 0
-    # copy: the cache to copy
+    # copy and extract: the cache to copy from. extend: the batch to append
     source: int = 0
-    # truncate: the cache's new length in tokens. load: the index, among the stage's layers,
+    # merge: the single-sequence caches to merge into a new batch, in order
+    sources: list[int] = Field(default_factory=list)
+    # filter: the rows to keep. extract: [the row to copy out]
+    rows: list[int] = Field(default_factory=list)
+    # prepare: padding to add to each row
+    left_padding: list[int] = Field(default_factory=list)
+    right_padding: list[int] = Field(default_factory=list)
+    # truncate: the cache's new length in tokens. trim: how many tokens to drop from a batch's
+    # end. load: the index, among the stage's layers,
     # of the first layer in this frame; 0 starts a new set of layers
     offset: int = 0
     # forward and hidden: the array that follows the header
@@ -56,11 +72,14 @@ class Frame(FrozenModel):
     payload_bytes: int = 0
     # hello and welcome
     protocol_version: int = 0
-    # welcome: the stage's device (its model identifier, e.g. iPad17,1), all its memory, and
-    # how much of that the stage itself can still allocate
+    # welcome: the stage's device (its model identifier, e.g. iPad17,1). welcome and
+    # counted: all its memory, and how much of that the stage itself can still allocate
     device_model: str = ""
     memory_total: int = 0
     memory_available: int = 0
+    # welcome: the most memory the device's GPU should use (Metal's recommended working set),
+    # or 0 if it didn't say
+    gpu_working_set: int = 0
     # load: the model's config.json; its payload is these layers' weights (named layers.N..,
     # N counted from the stage's first layer) and, in the first frame, `rope_freqs`, as
     # safetensors

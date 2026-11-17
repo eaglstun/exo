@@ -500,6 +500,9 @@ class InfoGatherer:
                         ram_available=welcome.memory_available,
                         swap_total=0,
                         swap_available=0,
+                        gpu_working_set=Memory.from_bytes(welcome.gpu_working_set)
+                        if welcome.gpu_working_set
+                        else None,
                     )
                 )
                 if not identified:

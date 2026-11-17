@@ -21,7 +21,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import psutil
 from loguru import logger
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.cache import BatchKVCache, KVCache
 from mlx_lm.models.llama import ModelArgs, TransformerBlock
 
 from exo.worker.engines.mlx.remote_stage.protocol import (
@@ -41,6 +42,10 @@ class _Blocks(nn.Module):
     def __init__(self, blocks: list[TransformerBlock]):
         super().__init__()
         self.layers = blocks
+
+
+# One layer's cache of one sequence, or of a batch
+StageCache = KVCache | BatchKVCache
 
 
 @final
@@ -77,9 +82,9 @@ class StageLayers:
             layer_count * 2 * kv_heads * head_dim * dtype.size
         )
 
-    def forward(self, hidden: mx.array, caches: list[KVCache]) -> mx.array:
-        # mlx-lm's attention takes "causal" too, which its stub doesn't say
-        mask = cast(mx.array | None, "causal" if hidden.shape[1] > 1 else None)
+    def forward(self, hidden: mx.array, caches: list[StageCache]) -> mx.array:
+        # As mlx-lm's Llama makes it: "causal", None, or for a batch, a mask of its padding
+        mask = cast(mx.array | None, create_attention_mask(hidden, caches[0]))
         for layer, cache in zip(self.layers, caches, strict=True):
             hidden = layer(hidden, mask, cache)
         return hidden
@@ -103,9 +108,15 @@ def _welcome() -> Frame:
     )
 
 
+def _batch(caches: dict[int, list[StageCache]], handle: int) -> list[BatchKVCache]:
+    batch = caches[handle]
+    assert all(isinstance(cache, BatchKVCache) for cache in batch)
+    return cast(list[BatchKVCache], batch)
+
+
 def serve_connection(connection: socket.socket) -> None:
     stage: StageLayers | None = None
-    caches: dict[int, list[KVCache]] = {}
+    caches: dict[int, list[StageCache]] = {}
     # The layers a load has sent so far, and how many it will send
     arriving: dict[str, mx.array] = {}
     expected_layers = 0
@@ -161,10 +172,53 @@ def serve_connection(connection: socket.socket) -> None:
                 del caches[frame.handle]
             case "truncate":
                 for cache in caches[frame.handle]:
+                    assert isinstance(cache, KVCache)
                     cache.offset = min(cache.offset, frame.offset)
+            case "merge":
+                sequences = [caches[source] for source in frame.sources]
+                caches[frame.handle] = [
+                    BatchKVCache.merge(
+                        [cast(KVCache, sequence[layer]) for sequence in sequences]
+                    )
+                    for layer in range(len(sequences[0]))
+                ]
+            case "extend":
+                for cache, other in zip(
+                    _batch(caches, frame.handle),
+                    _batch(caches, frame.source),
+                    strict=True,
+                ):
+                    cache.extend(other)
+            case "filter":
+                for cache in _batch(caches, frame.handle):
+                    cache.filter(frame.rows)
+            case "extract":
+                caches[frame.handle] = [
+                    cache.extract(frame.rows[0])
+                    for cache in _batch(caches, frame.source)
+                ]
+            case "prepare":
+                for cache in _batch(caches, frame.handle):
+                    cache.prepare(
+                        left_padding=frame.left_padding or None,
+                        right_padding=frame.right_padding or None,
+                    )
+            case "finalize":
+                for cache in _batch(caches, frame.handle):
+                    cache.finalize()
+            case "trim":
+                for cache in caches[frame.handle]:
+                    cache.trim(frame.offset)
             case "stats":
+                welcome = _welcome()
                 send_frame(
-                    connection, Frame(operation="counted", live_caches=len(caches))
+                    connection,
+                    Frame(
+                        operation="counted",
+                        live_caches=len(caches),
+                        memory_total=welcome.memory_total,
+                        memory_available=welcome.memory_available,
+                    ),
                 )
             case "forward":
                 if stage is None or frame.handle not in caches:

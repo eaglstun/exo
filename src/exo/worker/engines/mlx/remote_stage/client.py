@@ -20,8 +20,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from loguru import logger
 from mlx.utils import tree_flatten
+from mlx_lm.models.base import create_causal_mask
 from mlx_lm.models.cache import KVCache, create_attention_mask
 
+from exo.worker.engines.mlx.cache import add_memory_pressure_source
 from exo.worker.engines.mlx.remote_stage.protocol import (
     PROTOCOL_VERSION,
     Frame,
@@ -154,11 +156,25 @@ class RemoteStageLink:
         return handle
 
     def copy_cache(self, source: int) -> int:
+        return self._create(Frame(operation="copy", source=source))
+
+    def _create(self, frame: Frame) -> int:
+        """Send an operation that makes a cache, under a new handle"""
         with self._lock:
             handle = self._next_handle
             self._next_handle += 1
-            self._send(Frame(operation="copy", handle=handle, source=source))
+            self._send(frame.model_copy(update={"handle": handle}))
         return handle
+
+    def merge(self, sources: list[int]) -> int:
+        return self._create(Frame(operation="merge", sources=sources))
+
+    def extract(self, batch: int, row: int) -> int:
+        return self._create(Frame(operation="extract", source=batch, rows=[row]))
+
+    def post(self, frame: Frame) -> None:
+        """Send an operation the stage applies without answering"""
+        self._post(frame)
 
     def truncate(self, handle: int, offset: int) -> None:
         self._post(Frame(operation="truncate", handle=handle, offset=offset))
@@ -185,6 +201,13 @@ class RemoteStageLink:
 
     def live_caches(self) -> int:
         return self._request(Frame(operation="stats"))[0].live_caches
+
+    def memory_used_fraction(self) -> float:
+        """How full the stage's device is, 0 to 1, as its stats say now"""
+        counted = self._request(Frame(operation="stats"))[0]
+        if counted.memory_total <= 0:
+            return 0.0
+        return 1 - counted.memory_available / counted.memory_total
 
     def close(self) -> None:
         self._socket.close()
@@ -281,6 +304,187 @@ class RemoteKVCache:
             self._link, self._link.copy_cache(self.handle), self._offset
         )
 
+    def merge(self, caches: list["RemoteKVCache"]) -> "RemoteBatchKVCache":
+        """These sequences' caches as one batch (mlx-lm calls KVCache.merge on its first)"""
+        return RemoteBatchKVCache.merged(self._link, caches)
+
+    def __del__(self) -> None:
+        self._link.release(self.handle)
+
+
+@final
+class RemoteBatchKVCache:
+    """A batch of sequences' caches on the stage: mlx-lm's BatchKVCache, whose keys and
+    values stay there. Its bookkeeping (left padding, per-row offsets, length) is kept here
+    exactly as BatchKVCache keeps it, since mlx-lm and exo read it, and every change to it
+    is sent to the stage, which makes the same change to its BatchKVCaches."""
+
+    def __init__(
+        self,
+        link: RemoteStageLink,
+        handle: int,
+        left_padding: mx.array,
+        offset: mx.array,
+        length: int,
+        holds_tokens: bool,
+    ):
+        self._link = link
+        self.handle = handle
+        self.left_padding: mx.array = left_padding
+        self.offset: mx.array = offset
+        self._idx: int = length
+        self._right_padding: mx.array | None = None
+        # Whether the stage's BatchKVCaches have keys yet (BatchKVCache.empty)
+        self._holds_tokens = holds_tokens
+
+    @classmethod
+    def merged(
+        cls, link: RemoteStageLink, caches: list["RemoteKVCache"]
+    ) -> "RemoteBatchKVCache":
+        lengths = [cache.offset for cache in caches]
+        longest = max(lengths)
+        padding = [longest - length for length in lengths]
+        handle = link.merge([cache.handle for cache in caches])
+        return cls(
+            link,
+            handle,
+            mx.array(padding),
+            mx.array([longest - pad for pad in padding]),
+            longest,
+            holds_tokens=longest > 0,
+        )
+
+    def advance(self, tokens: int) -> None:
+        """The stage appended `tokens` to every row in a forward"""
+        self.offset = self.offset + tokens
+        self._idx += tokens
+        self._holds_tokens = True
+
+    @property
+    def state(self) -> list[mx.array]:
+        return []
+
+    def prepare(
+        self,
+        *,
+        left_padding: list[int] | None = None,
+        lengths: list[int] | None = None,
+        right_padding: list[int] | None = None,
+    ) -> None:
+        del lengths  # BatchKVCache doesn't use them either
+        if left_padding is not None:
+            if self._holds_tokens:
+                raise RemoteStageError(
+                    "Left padding can only be added to an empty BatchKVCache"
+                )
+            added = mx.array(left_padding)
+            self.left_padding = self.left_padding + added
+            self.offset = self.offset - added
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+        self._link.post(
+            Frame(
+                operation="prepare",
+                handle=self.handle,
+                left_padding=left_padding or [],
+                right_padding=right_padding or [],
+            )
+        )
+
+    def finalize(self) -> None:
+        if self._right_padding is not None:
+            self.offset = self.offset - self._right_padding
+            self.left_padding = self.left_padding + self._right_padding
+            self._right_padding = None
+            self._link.post(Frame(operation="finalize", handle=self.handle))
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset = self.offset - n
+        self._link.post(Frame(operation="trim", handle=self.handle, offset=n))
+        return n
+
+    def make_mask(
+        self, n: int, return_array: bool = False, **kwargs: object
+    ) -> mx.array:
+        del return_array
+        return create_causal_mask(
+            n,
+            offset=self._idx,
+            left_padding=self.left_padding,
+            **kwargs,  # pyright: ignore[reportArgumentType]
+        )
+
+    def filter(self, batch_indices: list[int] | mx.array) -> None:
+        rows = (
+            cast(list[int], batch_indices.tolist())
+            if isinstance(batch_indices, mx.array)
+            else list(batch_indices)
+        )
+        self.offset = self.offset[mx.array(rows)] if rows else mx.array([], mx.int32)
+        self.left_padding = (
+            self.left_padding[mx.array(rows)] if rows else mx.array([], mx.int32)
+        )
+        self._link.post(Frame(operation="filter", handle=self.handle, rows=rows))
+        if not rows:
+            return
+        # BatchKVCache drops the padding every row has
+        least_padding = min(cast(list[int], self.left_padding.tolist()))
+        if least_padding > 0:
+            self._idx -= least_padding
+            self.left_padding = self.left_padding - least_padding
+
+    def extend(self, other: "RemoteBatchKVCache") -> None:
+        if not self._holds_tokens and not other._holds_tokens:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+        else:
+            length = max(self._idx, other._idx)
+            self.left_padding = mx.concatenate(
+                [
+                    self.left_padding + (length - self._idx),
+                    other.left_padding + (length - other._idx),
+                ]
+            )
+            self.offset = mx.concatenate([self.offset, other.offset])
+            self._idx = length
+            self._holds_tokens = True
+        self._link.post(
+            Frame(operation="extend", handle=self.handle, source=other.handle)
+        )
+
+    def extract(self, idx: int) -> "RemoteKVCache":
+        padding = cast(list[int], self.left_padding.tolist())[idx]
+        return RemoteKVCache(
+            self._link, self._link.extract(self.handle, idx), self._idx - padding
+        )
+
+    def size(self) -> int:
+        return self._idx
+
+    def empty(self) -> bool:
+        return not self._holds_tokens
+
+    @property
+    def nbytes(self) -> int:
+        return self.offset.shape[0] * self._idx * self._link.kv_bytes_per_token
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "RemoteBatchKVCache":
+        copied = RemoteBatchKVCache(
+            self._link,
+            self._link.copy_cache(self.handle),
+            self.left_padding,
+            self.offset,
+            self._idx,
+            self._holds_tokens,
+        )
+        copied._right_padding = self._right_padding
+        return copied
+
     def __del__(self) -> None:
         self._link.release(self.handle)
 
@@ -298,7 +502,10 @@ class RemoteStage(nn.Module):
         self.use_sliding = False
 
     def __call__(
-        self, x: mx.array, mask: object = None, cache: RemoteKVCache | None = None
+        self,
+        x: mx.array,
+        mask: object = None,
+        cache: RemoteKVCache | RemoteBatchKVCache | None = None,
     ) -> mx.array:
         if cache is None:
             raise RemoteStageError("a remote stage runs only with its RemoteKVCache")
@@ -381,9 +588,6 @@ def attach_remote_stage(
 
 def _stage_config(model_path: Path) -> dict[str, object]:
     """The model's config, once checked that a stage can run its layers here"""
-    # The batch generator merges caches into BatchKVCaches, which a stage can't hold yet
-    if not os.environ.get("EXO_NO_BATCH"):
-        raise RemoteStageError(f"{REMOTE_STAGE_ENV} needs EXO_NO_BATCH=1")
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
@@ -409,6 +613,7 @@ def hand_layers_to_stage(
             "a remote stage can't run sliding-window attention layers"
         )
     link = RemoteStageLink(*stage_address)
+    add_memory_pressure_source(link.memory_used_fraction)
     rope = rope_frequencies(layers[0], config)
     for sent in link.load_layers(layers, config, rope):
         yield sent, len(layers)
@@ -445,6 +650,7 @@ def attach_configured_remote_stage(model: Model, model_path: Path) -> None:
     start_layer = end_layer - count
     host, _, port = address.rpartition(":")
     link = RemoteStageLink(host, int(port))
+    add_memory_pressure_source(link.memory_used_fraction)
     attach_remote_stage(model, link, start_layer, end_layer, config)
     logger.info(
         f"remote stage {address} runs this node's layers {start_layer}..{end_layer - 1}"
