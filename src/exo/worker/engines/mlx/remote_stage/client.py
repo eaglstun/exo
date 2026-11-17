@@ -41,9 +41,8 @@ from exo.worker.engines.mlx.remote_stage.settings import (
     is_stage_proxy,
 )
 from exo.worker.engines.mlx.sharding.blocks import LayerCallable
-from exo.worker.engines.mlx.sharding.pipeline import get_layers
+from exo.worker.engines.mlx.sharding.pipeline import get_inner_model, get_layers
 from exo.worker.engines.mlx.types import Model
-from exo.worker.engines.mlx.vision import get_inner_model
 
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 # The longest a stage may take to answer: a long prompt's chunk through many layers takes
@@ -57,8 +56,22 @@ ANSWER_TIMEOUT_SECONDS: Final = 120.0
 # linear attention layers keep a recurrent state instead of keys and values, dense or with
 # experts and a shared expert
 STAGE_MODEL_TYPES: Final = frozenset(
-    {"llama", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
+    {"llama", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "nemotron_h"}
 )
+
+
+def has_cache(layer: object) -> bool:
+    """Whether the model gives this layer a cache: every layer, except Nemotron-H's MLP and
+    mixture-of-experts layers (block types "-" and "E"), which mlx-lm makes none for"""
+    return getattr(layer, "block_type", None) not in ("-", "E")
+
+
+def is_recurrent(layer: object) -> bool:
+    """Whether this layer keeps a recurrent state rather than keys and values: Qwen3.5's
+    linear attention, Nemotron-H's Mamba-2"""
+    return bool(getattr(layer, "is_linear", False)) or (
+        getattr(layer, "block_type", None) == "M"
+    )
 
 
 class RemoteStageError(RuntimeError):
@@ -608,9 +621,11 @@ class RemoteStage(nn.Module):
         self._link = link
         self.start_layer = start_layer
         self.end_layer = end_layer
-        # mlx-lm's layer loops pick each layer's mask by these; the stage makes its own masks
+        # mlx-lm's layer loops pick each layer's mask by these; the stage makes its own masks.
+        # Nemotron-H's loop gives a cache only to Mamba-2 ("M") and attention ("*") blocks
         self.use_sliding = False
         self.is_linear = False
+        self.block_type = "*"
 
     def __call__(
         self,
@@ -633,8 +648,8 @@ def install_remote_stage(
     """Replace layers [start_layer, end_layer) of `model` with the stage, and give the model a
     `make_cache` that hands that position a RemoteKVCache (exo's make_kv_cache prefers a
     model's own make_cache)."""
-    inner = get_inner_model(model)  # pyright: ignore[reportAny]
-    layers: list[nn.Module] = list(inner.layers)  # pyright: ignore[reportAny]
+    inner = get_inner_model(model)
+    layers = cast(list[nn.Module], list(get_layers(inner)))
     if end_layer - start_layer != link.layer_count:
         raise RemoteStageError(
             f"the stage runs {link.layer_count} layers, not {end_layer - start_layer}"
@@ -646,26 +661,38 @@ def install_remote_stage(
             "a remote stage can't run sliding-window attention layers"
         )
     # Each layer left here keeps the kind of cache the model makes for it (a hybrid model's
-    # linear attention layers keep a recurrent state): made before the layers change
+    # linear attention layers keep a recurrent state): made before the layers change. The
+    # model's caches are those of its layers that have one, in order
     own_make_cache = cast(
         Callable[[], list[object]] | None, getattr(model, "make_cache", None)
     )
+    cached_layers = [index for index, layer in enumerate(layers) if has_cache(layer)]
     own_caches: list[object] = (
-        own_make_cache() if own_make_cache is not None else [KVCache() for _ in layers]
+        own_make_cache()
+        if own_make_cache is not None
+        else [KVCache() for _ in cached_layers]
     )
+    if len(own_caches) != len(cached_layers):
+        raise RemoteStageError(
+            f"the model makes {len(own_caches)} caches for {len(cached_layers)} layers"
+        )
+    own_cache_of = dict(zip(cached_layers, own_caches, strict=True))
     stage = RemoteStage(link, start_layer, end_layer)
     inner.layers = [*layers[:start_layer], stage, *layers[end_layer:]]
-    kept_caches = [*own_caches[:start_layer], None, *own_caches[end_layer:]]
+    # One per cache the model's loop hands out now: the stage's, then each kept layer's
+    kept_caches: list[object | None] = [
+        None if index == start_layer else own_cache_of[index]
+        for index in [*range(start_layer + 1), *range(end_layer, len(layers))]
+        if index == start_layer or index in own_cache_of
+    ]
     _point_masks_at_kept_layers(
         cast(object, inner), cast(list[nn.Module], inner.layers)
     )
 
     def make_cache() -> list[object]:
         return [
-            remote_cache(link) if layer is stage else deepcopy(kept)
-            for layer, kept in zip(
-                cast(list[nn.Module], inner.layers), kept_caches, strict=True
-            )
+            remote_cache(link) if kept is None else deepcopy(kept)
+            for kept in kept_caches
         ]
 
     make: Callable[[], list[object]] = make_cache
@@ -673,16 +700,17 @@ def install_remote_stage(
 
 
 def _point_masks_at_kept_layers(inner: object, layers: list[nn.Module]) -> None:
-    """A hybrid model (Qwen3.5) makes its attention and linear attention masks from the cache
-    of its first layer of each kind (fa_idx, ssm_idx): once the stage stands in for some of
-    them, from the first one left here, or the stage's (which ignores masks)."""
+    """A hybrid model (Qwen3.5, Nemotron-H) makes its attention and recurrent masks from the
+    cache of its first layer of each kind (fa_idx, ssm_idx, indices into its caches): once
+    the stage stands in for some of them, from the first one left here, or the stage's (which
+    ignores masks)."""
     if not hasattr(inner, "fa_idx") or not hasattr(inner, "ssm_idx"):
         return
+    # One per cache: None for the stage's
     kinds = [
-        None
-        if isinstance(layer, RemoteStage)
-        else cast(bool, getattr(layer, "is_linear", False))
+        None if isinstance(layer, RemoteStage) else is_recurrent(layer)
         for layer in layers
+        if has_cache(layer)
     ]
     stage_index = kinds.index(None)
     attention = next((i for i, k in enumerate(kinds) if k is False), stage_index)
@@ -790,7 +818,7 @@ def attach_remote_stage(
         raise RemoteStageError(
             f"a remote stage can't run {config.get('model_type')} layers yet"
         )
-    layers = cast(list[nn.Module], list(get_layers(get_inner_model(model))))  # pyright: ignore[reportAny]
+    layers = cast(list[nn.Module], list(get_layers(get_inner_model(model))))
     link.load(
         layers[start_layer:end_layer],
         config,
@@ -831,6 +859,12 @@ def hand_layers_to_stage(
     for sent in link.load_layers(layers, config, rope):
         yield sent, len(layers)
     stage = RemoteStage(link, 0, len(layers))
+    # Its one cache is the stage's: a hybrid model's masks come from it (a pipeline shard's
+    # fix_pipeline_shard says the same once it has run)
+    inner = cast(object, get_inner_model(model))
+    for mask_index in ("fa_idx", "ssm_idx"):
+        if hasattr(inner, mask_index):
+            setattr(inner, mask_index, 0)
 
     def make_cache() -> list[RemoteKVCache]:
         return [remote_cache(link)]
@@ -853,7 +887,7 @@ def attach_configured_remote_stage(model: Model, model_path: Path) -> None:
     if not address or is_stage_proxy():
         return
     config = _stage_config(model_path)
-    layer_count = len(get_layers(get_inner_model(model)))  # pyright: ignore[reportAny]
+    layer_count = len(get_layers(get_inner_model(model)))
     wanted = int(os.environ.get(REMOTE_STAGE_LAYERS_ENV) or layer_count // 2)
     count = max(0, min(wanted, layer_count - 2))
     if count == 0:

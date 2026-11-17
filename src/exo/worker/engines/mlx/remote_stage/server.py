@@ -26,9 +26,18 @@ from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_lm.models.llama import ModelArgs as LlamaArgs
 from mlx_lm.models.llama import TransformerBlock as LlamaBlock
+from mlx_lm.models.nemotron_h import NemotronHBlock, NemotronHMamba2Mixer, NemotronHMoE
 from mlx_lm.models.qwen3 import ModelArgs as Qwen3Args
 from mlx_lm.models.qwen3 import TransformerBlock as Qwen3Block
 
+from exo.worker.engines.mlx.models.nemotron_h.model import (
+    Float32Mamba2Mixer,
+    Float32RouterGate,
+)
+from exo.worker.engines.mlx.models.nemotron_h.model import (
+    ModelArgs as NemotronHArgs,
+)
+from exo.worker.engines.mlx.remote_stage.client import has_cache, is_recurrent
 from exo.worker.engines.mlx.remote_stage.protocol import (
     PROTOCOL_VERSION,
     Frame,
@@ -81,17 +90,39 @@ def _block(
             return qwen3_5.DecoderLayer(
                 args, layer_idx=0 if is_linear else args.full_attention_interval - 1
             )
+        case "nemotron_h":
+            return _nemotron_h_block(config, weights, index)
         case other:
             raise ValueError(f"this stage can't run {other} layers")
+
+
+def _nemotron_h_block(
+    config: dict[str, object], weights: dict[str, mx.array], index: int
+) -> nn.Module:
+    """A Nemotron-H block as exo builds it (models/nemotron_h/model.py: the Mamba-2 mixer and
+    the router in float32). Its type follows from its index in the whole model: its weights
+    say"""
+    args = NemotronHArgs.from_dict(config)
+    mixer = f"layers.{index}.mixer"
+    if f"{mixer}.A_log" in weights:
+        block_type = "M"
+    elif f"{mixer}.q_proj.weight" in weights:
+        block_type = "*"
+    elif f"{mixer}.gate.weight" in weights:
+        block_type = "E"
+    else:
+        block_type = "-"
+    block = NemotronHBlock(args, block_type)
+    if isinstance(block.mixer, NemotronHMoE):
+        block.mixer.gate = Float32RouterGate(args)
+    elif isinstance(block.mixer, NemotronHMamba2Mixer):
+        block.mixer = Float32Mamba2Mixer(args)
+    return block
 
 
 # One layer's cache of one sequence, or of a batch: keys and values, or a linear attention
 # layer's recurrent state (which ArraysCache keeps for a batch as for one sequence)
 StageCache = KVCache | BatchKVCache | ArraysCache
-
-
-def _is_linear(layer: nn.Module) -> bool:
-    return bool(getattr(layer, "is_linear", False))
 
 
 @final
@@ -133,11 +164,21 @@ class StageLayers:
         head_dim = cast(
             int, config.get("head_dim") or cast(int, config["hidden_size"]) // heads
         )
-        # Keys and values, per attention layer, kept in the activations' dtype
-        dtype = weights["layers.0.input_layernorm.weight"].dtype
-        linear = [_is_linear(layer) for layer in self.layers]
+        # Keys and values, per attention layer, kept in the activations' dtype (a norm's)
+        dtype = next(
+            array.dtype
+            for name, array in weights.items()
+            if name.startswith("layers.0.") and name.endswith("norm.weight")
+        )
+        # The layers that have a cache, and of those, which keep a recurrent state
+        self.cached: Final = [has_cache(layer) for layer in self.layers]
+        recurrent = [
+            is_recurrent(layer)
+            for layer, cached in zip(self.layers, self.cached, strict=True)
+            if cached
+        ]
         self.kv_bytes_per_token: Final = (
-            linear.count(False) * 2 * kv_heads * head_dim * dtype.size
+            recurrent.count(False) * 2 * kv_heads * head_dim * dtype.size
         )
         # A linear attention layer's recurrent state: the last (kernel - 1) inputs of its
         # convolution, in the activations' dtype, and its float32 state per value head
@@ -157,13 +198,24 @@ class StageLayers:
             * cast(int, config.get("linear_key_head_dim", 0))
             * mx.float32.size
         )
-        self.state_bytes: Final = linear.count(True) * (conv_bytes + state_bytes)
+        if config.get("model_type") == "nemotron_h":
+            # A Mamba-2 layer's: the last (kernel - 1) inputs of its convolution, in the
+            # activations' dtype, and its float32 state per head
+            heads = cast(int, config["mamba_num_heads"])
+            head_dim = cast(int, config["mamba_head_dim"])
+            state_size = cast(int, config["ssm_state_size"])
+            conv_dim = heads * head_dim + 2 * cast(int, config["n_groups"]) * state_size
+            conv_bytes = (cast(int, config["conv_kernel"]) - 1) * conv_dim * dtype.size
+            state_bytes = heads * head_dim * state_size * mx.float32.size
+        self.state_bytes: Final = recurrent.count(True) * (conv_bytes + state_bytes)
 
     def make_caches(self) -> list[StageCache]:
-        """A sequence's empty caches, one per layer, as mlx-lm's models make them"""
+        """A sequence's empty caches, one per layer that has one, as mlx-lm's models make
+        them"""
         return [
-            ArraysCache(size=2) if _is_linear(layer) else KVCache()
-            for layer in self.layers
+            ArraysCache(size=2) if is_recurrent(layer) else KVCache()
+            for layer, cached in zip(self.layers, self.cached, strict=True)
+            if cached
         ]
 
     def forward(self, hidden: mx.array, caches: list[StageCache]) -> mx.array:
@@ -179,9 +231,13 @@ class StageLayers:
         recurrent_mask = (
             create_ssm_mask(hidden, recurrent) if recurrent is not None else None
         )
-        for layer, cache in zip(self.layers, caches, strict=True):
-            mask = recurrent_mask if _is_linear(layer) else attention_mask
-            hidden = layer(hidden, mask, cache)
+        layer_caches = iter(caches)
+        for layer, cached in zip(self.layers, self.cached, strict=True):
+            if not cached:
+                hidden = layer(hidden)
+                continue
+            mask = recurrent_mask if is_recurrent(layer) else attention_mask
+            hidden = layer(hidden, mask, next(layer_caches))
         return hidden
 
 

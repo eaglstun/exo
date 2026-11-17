@@ -34,21 +34,23 @@ from exo.shared.types.worker.runner_response import GenerationResponse
 from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt, make_kv_cache
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import mlx_generate
+from exo.worker.engines.mlx.models.registry import get_model_classes
 from exo.worker.engines.mlx.remote_stage.client import (
     RemoteStage,
     RemoteStageLink,
     RemoteStageLostError,
     attach_remote_stage,
+    has_cache,
+    is_recurrent,
     remote_cache,
     rope_frequencies,
 )
-from exo.worker.engines.mlx.sharding.pipeline import get_layers
+from exo.worker.engines.mlx.sharding.pipeline import get_inner_model, get_layers
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     load_tokenizer_for_model_id,
 )
-from exo.worker.engines.mlx.vision import get_inner_model
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,26 @@ MODELS = [
     StagedModel(ModelId("mlx-community/Qwen3.5-2B-MLX-8bit"), 12, 24),
     # Qwen3.5 with 256 experts, 8 per token, and a shared expert
     StagedModel(ModelId("mlx-community/Qwen3.5-35B-A3B-4bit"), 34, 40),
+    # Nemotron-H: Mamba-2, attention without RoPE and MLP blocks, only the first two with a
+    # cache; the layers left before the stage have no attention
+    StagedModel(ModelId("mlx-community/NVIDIA-Nemotron-Nano-9B-v2-4bits"), 12, 24),
+    # Nemotron-H with 128 experts, 6 per token by a sigmoid router with a correction bias, and
+    # a shared expert
+    StagedModel(
+        ModelId("mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-MLX-4Bit"), 40, 48
+    ),
 ]
+
+
+def _load_model(model_path: Path) -> tuple[nn.Module, dict[str, object]]:
+    """As exo loads it: with its own model classes where it has them (Nemotron-H's computes
+    its Mamba-2 mixer and router in float32)"""
+    return cast(
+        tuple[nn.Module, dict[str, object]],
+        load_model(model_path, get_model_classes=get_model_classes),
+    )
+
+
 # How close, in logprob, two greedy candidates are when another GPU may pick either
 TIE_LOGPROB_GAP = 0.02
 
@@ -255,8 +276,8 @@ def test_remote_stage_generates_what_the_whole_model_does(
 ) -> None:
     model_id = staged_model.model_id
     tokenizer = load_tokenizer_for_model_id(model_id, model_path)
-    whole, _ = load_model(model_path)
-    staged, _ = load_model(model_path)
+    whole, _ = _load_model(model_path)
+    staged, _ = _load_model(model_path)
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
@@ -371,12 +392,12 @@ def test_remote_stage_computes_the_layers_bit_for_bit(
     it runs on this GPU: matching tokens can hide a stage that computes otherwise (e.g. one
     whose layers are left in training mode, which runs Qwen3.5's linear attention as ops)"""
     tokenizer = load_tokenizer_for_model_id(staged_model.model_id, model_path)
-    model, _ = load_model(model_path)
+    model, _ = _load_model(model_path)
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
-    inner = get_inner_model(model)  # pyright: ignore[reportAny]
-    layers = cast(list[nn.Module], list(get_layers(inner)))  # pyright: ignore[reportAny]
+    inner = get_inner_model(model)
+    layers = cast(list[nn.Module], list(get_layers(inner)))
     staged = layers[staged_model.start_layer : staged_model.end_layer]
     link.load(staged, config, rope_frequencies(staged))
     prompt = encode_prompt(
@@ -390,17 +411,26 @@ def test_remote_stage_computes_the_layers_bit_for_bit(
             ),
         ),
     )
-    caches = make_kv_cache(model)  # pyright: ignore[reportArgumentType]
-    hidden = cast(nn.Module, inner.embed_tokens)(prompt[None])
+    # One per layer that has a cache (Nemotron-H's MLP and expert layers have none)
+    caches = iter(make_kv_cache(model))  # pyright: ignore[reportArgumentType]
+    owner = cast(object, inner)
+    embed = cast(
+        nn.Module,
+        getattr(owner, "embed_tokens", None) or getattr(owner, "embeddings"),  # noqa: B009
+    )
+    hidden = embed(prompt[None])
     attention_mask = cast(mx.array | None, create_attention_mask(hidden, None))
     stage_input = hidden
-    for index, (layer, cache) in enumerate(zip(layers, caches, strict=True)):
+    for index, layer in enumerate(layers):
         if index == staged_model.start_layer:
             stage_input = hidden
         if index == staged_model.end_layer:
             break
-        linear = bool(getattr(layer, "is_linear", False))
-        hidden = layer(hidden, None if linear else attention_mask, cache)
+        if not has_cache(layer):
+            hidden = layer(hidden)
+            continue
+        mask = None if is_recurrent(layer) else attention_mask
+        hidden = layer(hidden, mask, next(caches))
     mx.eval(hidden)
     stage_output = RemoteStage(link, 0, len(staged))(
         stage_input, None, remote_cache(link)
@@ -452,8 +482,8 @@ def test_remote_stage_generates_what_the_whole_model_does_in_a_batch(
     the stage merges, extends, filters and extracts its batch caches as mlx-lm does"""
     model_id = staged_model.model_id
     tokenizer = load_tokenizer_for_model_id(model_id, model_path)
-    whole, _ = load_model(model_path)
-    staged, _ = load_model(model_path)
+    whole, _ = _load_model(model_path)
+    staged, _ = _load_model(model_path)
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
