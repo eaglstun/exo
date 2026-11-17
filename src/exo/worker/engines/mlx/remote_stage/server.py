@@ -21,9 +21,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import psutil
 from loguru import logger
-from mlx_lm.models import qwen3_moe
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import BatchKVCache, KVCache
+from mlx_lm.models import qwen3_5, qwen3_moe
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_lm.models.llama import ModelArgs as LlamaArgs
 from mlx_lm.models.llama import TransformerBlock as LlamaBlock
 from mlx_lm.models.qwen3 import ModelArgs as Qwen3Args
@@ -72,12 +72,26 @@ def _block(
                 ),
             )
             return qwen3_moe.Qwen3MoeDecoderLayer(args, layer_idx=0)
+        case "qwen3_5":
+            # Linear attention or full attention follows from the layer's index in the whole
+            # model too: its weights say. mlx-lm makes layer i linear unless (i + 1) is a
+            # multiple of full_attention_interval
+            args = qwen3_5.TextModelArgs.from_dict(config)
+            is_linear = f"layers.{index}.linear_attn.A_log" in weights
+            return qwen3_5.DecoderLayer(
+                args, layer_idx=0 if is_linear else args.full_attention_interval - 1
+            )
         case other:
             raise ValueError(f"this stage can't run {other} layers")
 
 
-# One layer's cache of one sequence, or of a batch
-StageCache = KVCache | BatchKVCache
+# One layer's cache of one sequence, or of a batch: keys and values, or a linear attention
+# layer's recurrent state (which ArraysCache keeps for a batch as for one sequence)
+StageCache = KVCache | BatchKVCache | ArraysCache
+
+
+def _is_linear(layer: nn.Module) -> bool:
+    return bool(getattr(layer, "is_linear", False))
 
 
 @final
@@ -116,16 +130,54 @@ class StageLayers:
         head_dim = cast(
             int, config.get("head_dim") or cast(int, config["hidden_size"]) // heads
         )
-        # Keys and values, per layer, kept in the activations' dtype
+        # Keys and values, per attention layer, kept in the activations' dtype
         dtype = weights["layers.0.input_layernorm.weight"].dtype
+        linear = [_is_linear(layer) for layer in self.layers]
         self.kv_bytes_per_token: Final = (
-            layer_count * 2 * kv_heads * head_dim * dtype.size
+            linear.count(False) * 2 * kv_heads * head_dim * dtype.size
         )
+        # A linear attention layer's recurrent state: the last (kernel - 1) inputs of its
+        # convolution, in the activations' dtype, and its float32 state per value head
+        conv_dim = 2 * cast(int, config.get("linear_num_key_heads", 0)) * cast(
+            int, config.get("linear_key_head_dim", 0)
+        ) + cast(int, config.get("linear_num_value_heads", 0)) * cast(
+            int, config.get("linear_value_head_dim", 0)
+        )
+        conv_bytes = (
+            (cast(int, config.get("linear_conv_kernel_dim", 1)) - 1)
+            * conv_dim
+            * dtype.size
+        )
+        state_bytes = (
+            cast(int, config.get("linear_num_value_heads", 0))
+            * cast(int, config.get("linear_value_head_dim", 0))
+            * cast(int, config.get("linear_key_head_dim", 0))
+            * mx.float32.size
+        )
+        self.state_bytes: Final = linear.count(True) * (conv_bytes + state_bytes)
+
+    def make_caches(self) -> list[StageCache]:
+        """A sequence's empty caches, one per layer, as mlx-lm's models make them"""
+        return [
+            ArraysCache(size=2) if _is_linear(layer) else KVCache()
+            for layer in self.layers
+        ]
 
     def forward(self, hidden: mx.array, caches: list[StageCache]) -> mx.array:
-        # As mlx-lm's Llama makes it: "causal", None, or for a batch, a mask of its padding
-        mask = cast(mx.array | None, create_attention_mask(hidden, caches[0]))
+        # As mlx-lm's models make them, from the first cache of each kind: "causal", None, or
+        # for a batch, a mask of its padding
+        attention = next((c for c in caches if not isinstance(c, ArraysCache)), None)
+        recurrent = next((c for c in caches if isinstance(c, ArraysCache)), None)
+        attention_mask = (
+            cast(mx.array | None, create_attention_mask(hidden, attention))
+            if attention is not None
+            else None
+        )
+        recurrent_mask = (
+            create_ssm_mask(hidden, recurrent) if recurrent is not None else None
+        )
         for layer, cache in zip(self.layers, caches, strict=True):
+            mask = recurrent_mask if _is_linear(layer) else attention_mask
             hidden = layer(hidden, mask, cache)
         return hidden
 
@@ -148,10 +200,29 @@ def _welcome() -> Frame:
     )
 
 
-def _batch(caches: dict[int, list[StageCache]], handle: int) -> list[BatchKVCache]:
+def _batch(
+    caches: dict[int, list[StageCache]], handle: int
+) -> list[BatchKVCache | ArraysCache]:
     batch = caches[handle]
-    assert all(isinstance(cache, BatchKVCache) for cache in batch)
-    return cast(list[BatchKVCache], batch)
+    assert all(isinstance(cache, (BatchKVCache, ArraysCache)) for cache in batch)
+    return cast(list[BatchKVCache | ArraysCache], batch)
+
+
+def _recurrent_state(layer_caches: list[StageCache]) -> list[mx.array]:
+    return [
+        array
+        for cache in layer_caches
+        if isinstance(cache, ArraysCache)
+        for array in cache.cache
+        if array is not None
+    ]
+
+
+def _merge(layer_caches: list[StageCache]) -> BatchKVCache | ArraysCache:
+    """One layer's caches of several sequences, as one batch"""
+    if all(isinstance(cache, ArraysCache) for cache in layer_caches):
+        return ArraysCache.merge(cast(list[ArraysCache], layer_caches))
+    return BatchKVCache.merge(cast(list[KVCache], layer_caches))
 
 
 def serve_connection(connection: socket.socket) -> None:
@@ -201,25 +272,28 @@ def serve_connection(connection: socket.socket) -> None:
                         operation="loaded",
                         layer_count=received,
                         kv_bytes_per_token=stage.kv_bytes_per_token if stage else 0,
+                        state_bytes=stage.state_bytes if stage else 0,
                     ),
                 )
             case "new":
                 if stage is not None:
-                    caches[frame.handle] = [KVCache() for _ in stage.layers]
+                    caches[frame.handle] = stage.make_caches()
             case "copy":
                 caches[frame.handle] = deepcopy(caches[frame.source])
             case "free":
-                del caches[frame.handle]
+                # Possibly a cache from before the node loaded other layers, which dropped
+                # them all
+                caches.pop(frame.handle, None)
             case "truncate":
+                # Only a stage without recurrent state is sent truncate: the node goes
+                # back to a copy instead (RemoteSnapshotCache)
                 for cache in caches[frame.handle]:
                     assert isinstance(cache, KVCache)
                     cache.offset = min(cache.offset, frame.offset)
             case "merge":
                 sequences = [caches[source] for source in frame.sources]
                 caches[frame.handle] = [
-                    BatchKVCache.merge(
-                        [cast(KVCache, sequence[layer]) for sequence in sequences]
-                    )
+                    _merge([sequence[layer] for sequence in sequences])
                     for layer in range(len(sequences[0]))
                 ]
             case "extend":
@@ -228,7 +302,7 @@ def serve_connection(connection: socket.socket) -> None:
                     _batch(caches, frame.source),
                     strict=True,
                 ):
-                    cache.extend(other)
+                    cache.extend(other)  # pyright: ignore[reportArgumentType]
             case "filter":
                 for cache in _batch(caches, frame.handle):
                     cache.filter(frame.rows)
@@ -239,6 +313,12 @@ def serve_connection(connection: socket.socket) -> None:
                 ]
             case "prepare":
                 for cache in _batch(caches, frame.handle):
+                    if isinstance(cache, ArraysCache):
+                        # Its prepare takes each row's length, which right padding
+                        # would need: exo pads only on the left, where the state needs
+                        # nothing
+                        assert not any(frame.right_padding)
+                        continue
                     cache.prepare(
                         left_padding=frame.left_padding or None,
                         right_padding=frame.right_padding or None,
@@ -248,6 +328,7 @@ def serve_connection(connection: socket.socket) -> None:
                     cache.finalize()
             case "trim":
                 for cache in caches[frame.handle]:
+                    assert not isinstance(cache, ArraysCache)
                     cache.trim(frame.offset)
             case "stats":
                 welcome = _welcome()
@@ -268,7 +349,9 @@ def serve_connection(connection: socket.socket) -> None:
                 output = stage.forward(hidden, caches[frame.handle]).astype(
                     hidden.dtype
                 )
-                mx.eval(output)
+                # With the recurrent state, which nothing else this step reads: copies of
+                # the cache (snapshots) hold evaluated arrays, not a graph that grows
+                mx.eval(output, *_recurrent_state(caches[frame.handle]))
                 data = array_to_bytes(output)
                 send_frame(
                     connection,

@@ -11,8 +11,6 @@ from exo.worker.engines.mlx.remote_stage.client import (
     stage_quantization,
 )
 
-CONFIG: dict[str, object] = {"num_attention_heads": 4, "hidden_size": 256}
-
 
 class _Attention(nn.Module):
     def __init__(self, rope: nn.Module) -> None:
@@ -55,12 +53,19 @@ def test_other_than_affine_quantization_is_refused() -> None:
 
 
 def test_plain_rope_is_its_base_to_the_power_of_each_dimension() -> None:
-    frequencies = rope_frequencies(_Layer(), CONFIG)
+    frequencies = rope_frequencies([_Layer()])
 
     expected = mx.power(
         mx.array(1_000_000.0), mx.arange(0, 64, 2, dtype=mx.float32) / 64
     )
     assert mx.allclose(frequencies, expected).item()
+
+
+def test_partial_rope_has_frequencies_for_the_dimensions_it_rotates() -> None:
+    # Qwen3.5 rotates a quarter of each head's dimensions
+    frequencies = rope_frequencies([_Layer(nn.RoPE(64, base=10_000_000.0))])
+
+    assert frequencies.shape == (32,)
 
 
 @pytest.mark.parametrize(
@@ -73,4 +78,4 @@ def test_plain_rope_is_its_base_to_the_power_of_each_dimension() -> None:
 )
 def test_rope_a_stage_cant_reproduce_is_refused(rope: nn.Module) -> None:
     with pytest.raises(RemoteStageError, match="RoPE"):
-        rope_frequencies(_Layer(rope), CONFIG)
+        rope_frequencies([_Layer(rope)])

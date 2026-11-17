@@ -13,6 +13,7 @@ import tempfile
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
+from copy import deepcopy
 from pathlib import Path
 from typing import Final, cast, final
 
@@ -52,8 +53,9 @@ ANSWER_TIMEOUT_SECONDS: Final = 120.0
 
 # The model families whose layers a stage can run: their blocks are all the same
 # The model types whose layers a stage can run: a Llama layer, or one with Qwen3's norms of
-# each head's queries and keys, and a dense or mixture-of-experts MLP
-STAGE_MODEL_TYPES: Final = frozenset({"llama", "qwen3", "qwen3_moe"})
+# each head's queries and keys, and a dense or mixture-of-experts MLP; and Qwen3.5's, whose
+# linear attention layers keep a recurrent state instead of keys and values
+STAGE_MODEL_TYPES: Final = frozenset({"llama", "qwen3", "qwen3_moe", "qwen3_5"})
 
 
 class RemoteStageError(RuntimeError):
@@ -102,6 +104,8 @@ class RemoteStageLink:
         # Set by load
         self.layer_count = 0
         self.kv_bytes_per_token = 0
+        # One sequence's recurrent state on the stage (0: the stage keeps only KV caches)
+        self.state_bytes = 0
 
     def load(
         self, layers: list[nn.Module], config: dict[str, object], rope_freqs: mx.array
@@ -116,8 +120,9 @@ class RemoteStageLink:
         """Send the stage these layers' weights, one layer per frame, yielding how many it
         has after each. Only one layer at a time is read into memory here: from a lazily
         loaded model, the rest never are."""
-        # The config as the stage reads it: each quantized module's own bits, by the stage's
-        # names for them
+        # The config as the stage reads it: the text model's, with each quantized module's
+        # own bits, by the stage's names for them
+        config = stage_config(config)
         given_quantization = cast(dict[str, object], config.get("quantization") or {})
         config_json = json.dumps(
             {
@@ -161,6 +166,7 @@ class RemoteStageLink:
             if loaded.layer_count == len(layers):
                 self.layer_count = loaded.layer_count
                 self.kv_bytes_per_token = loaded.kv_bytes_per_token
+                self.state_bytes = loaded.state_bytes
 
     def _send(self, frame: Frame, payload: bytes = b"") -> None:
         try:
@@ -283,12 +289,12 @@ def greet_stage(host: str, port: int) -> Frame:
     return welcome
 
 
-@final
 class RemoteKVCache:
     """The caches of a remote stage's layers, held on the stage and named by a handle.
 
     Duck-typed like mlx-lm's caches, through the members exo and mlx-lm use: it isn't one of
-    exo's SnapshotCaches (no prefix_cache_snapshot), so the prefix cache trims it."""
+    exo's SnapshotCaches (no prefix_cache_snapshot), so the prefix cache trims it. A stage with
+    recurrent state hands out RemoteSnapshotCaches instead (remote_cache)."""
 
     def __init__(
         self, link: RemoteStageLink, handle: int | None = None, offset: int = 0
@@ -346,7 +352,7 @@ class RemoteKVCache:
         return create_attention_mask(n, self._offset, return_array, window_size)
 
     def __deepcopy__(self, memo: dict[int, object]) -> "RemoteKVCache":
-        return RemoteKVCache(
+        return remote_cache(
             self._link, self._link.copy_cache(self.handle), self._offset
         )
 
@@ -356,6 +362,58 @@ class RemoteKVCache:
 
     def __del__(self) -> None:
         self._link.release(self.handle)
+
+
+@final
+class RemoteSnapshotCache(RemoteKVCache):
+    """The caches of a stage whose layers keep a recurrent state (Qwen3.5's linear attention):
+    that state can't go back token by token, so this can't be trimmed. It's one of exo's
+    SnapshotCaches: the prefix cache keeps copies of it taken at known token counts, and goes
+    back to one of those. A copy on the stage shares its arrays until either moves on."""
+
+    @property
+    def offset(self) -> int:
+        return self._offset
+
+    @offset.setter
+    def offset(self, value: int) -> None:
+        if value != self._offset:
+            raise RemoteStageError(
+                f"a remote cache with recurrent state can't go from {self._offset} to "
+                f"{value} tokens: only back to a snapshot"
+            )
+
+    def prefix_cache_snapshot(self) -> "RemoteSnapshotCache":
+        """A copy of the stage's caches as they are now (the stage evaluates them after
+        every forward)"""
+        return RemoteSnapshotCache(
+            self._link, self._link.copy_cache(self.handle), self._offset
+        )
+
+    def is_trimmable(self) -> bool:
+        return False
+
+    def trim(self, n: int) -> int:
+        if n > 0:
+            raise RemoteStageError(
+                "a remote cache with recurrent state can't be trimmed: only restored "
+                "from a snapshot"
+            )
+        return 0
+
+    @property
+    def nbytes(self) -> int:
+        return super().nbytes + self._link.state_bytes
+
+
+def remote_cache(
+    link: RemoteStageLink, handle: int | None = None, offset: int = 0
+) -> RemoteKVCache:
+    """A sequence's caches on the stage: a RemoteSnapshotCache when the stage keeps
+    recurrent state, else one that trims"""
+    if link.state_bytes:
+        return RemoteSnapshotCache(link, handle, offset)
+    return RemoteKVCache(link, handle, offset)
 
 
 @final
@@ -505,7 +563,7 @@ class RemoteBatchKVCache:
 
     def extract(self, idx: int) -> "RemoteKVCache":
         padding = cast(list[int], self.left_padding.tolist())[idx]
-        return RemoteKVCache(
+        return remote_cache(
             self._link, self._link.extract(self.handle, idx), self._idx - padding
         )
 
@@ -517,7 +575,10 @@ class RemoteBatchKVCache:
 
     @property
     def nbytes(self) -> int:
-        return self.offset.shape[0] * self._idx * self._link.kv_bytes_per_token
+        rows = self.offset.shape[0]
+        return rows * (
+            self._idx * self._link.kv_bytes_per_token + self._link.state_bytes
+        )
 
     def __deepcopy__(self, memo: dict[int, object]) -> "RemoteBatchKVCache":
         copied = RemoteBatchKVCache(
@@ -544,8 +605,9 @@ class RemoteStage(nn.Module):
         self._link = link
         self.start_layer = start_layer
         self.end_layer = end_layer
-        # mlx-lm's layer loops pick each layer's mask by this; the stage masks causally only
+        # mlx-lm's layer loops pick each layer's mask by these; the stage makes its own masks
         self.use_sliding = False
+        self.is_linear = False
 
     def __call__(
         self,
@@ -580,25 +642,65 @@ def install_remote_stage(
         raise RemoteStageError(
             "a remote stage can't run sliding-window attention layers"
         )
+    # Each layer left here keeps the kind of cache the model makes for it (a hybrid model's
+    # linear attention layers keep a recurrent state): made before the layers change
+    own_make_cache = cast(
+        Callable[[], list[object]] | None, getattr(model, "make_cache", None)
+    )
+    own_caches: list[object] = (
+        own_make_cache() if own_make_cache is not None else [KVCache() for _ in layers]
+    )
     stage = RemoteStage(link, start_layer, end_layer)
     inner.layers = [*layers[:start_layer], stage, *layers[end_layer:]]
+    kept_caches = [*own_caches[:start_layer], None, *own_caches[end_layer:]]
+    _point_masks_at_kept_layers(
+        cast(object, inner), cast(list[nn.Module], inner.layers)
+    )
 
-    def make_cache() -> list[KVCache | RemoteKVCache]:
+    def make_cache() -> list[object]:
         return [
-            RemoteKVCache(link) if layer is stage else KVCache()
-            for layer in inner.layers  # pyright: ignore[reportAny]
+            remote_cache(link) if layer is stage else deepcopy(kept)
+            for layer, kept in zip(
+                cast(list[nn.Module], inner.layers), kept_caches, strict=True
+            )
         ]
 
-    make: Callable[[], list[KVCache | RemoteKVCache]] = make_cache
+    make: Callable[[], list[object]] = make_cache
     setattr(model, "make_cache", make)  # noqa: B010
 
 
-def rope_frequencies(layer: nn.Module, config: dict[str, object]) -> mx.array:
-    """What mx.fast.rope takes as `freqs` for this layer's attention: the model's own when it
-    scales RoPE (llama3), else base ** (2i / dims), which is what `base` alone means. A stage
+def _point_masks_at_kept_layers(inner: object, layers: list[nn.Module]) -> None:
+    """A hybrid model (Qwen3.5) makes its attention and linear attention masks from the cache
+    of its first layer of each kind (fa_idx, ssm_idx): once the stage stands in for some of
+    them, from the first one left here, or the stage's (which ignores masks)."""
+    if not hasattr(inner, "fa_idx") or not hasattr(inner, "ssm_idx"):
+        return
+    kinds = [
+        None
+        if isinstance(layer, RemoteStage)
+        else cast(bool, getattr(layer, "is_linear", False))
+        for layer in layers
+    ]
+    stage_index = kinds.index(None)
+    attention = next((i for i, k in enumerate(kinds) if k is False), stage_index)
+    linear = next((i for i, k in enumerate(kinds) if k is True), stage_index)
+    setattr(inner, "fa_idx", attention)  # noqa: B010
+    setattr(inner, "ssm_idx", linear)  # noqa: B010
+
+
+def rope_frequencies(layers: Sequence[nn.Module]) -> mx.array:
+    """What mx.fast.rope takes as `freqs` for these layers' attention (none, if they have
+    only linear attention): the model's own when it scales RoPE (llama3), else
+    base ** (2i / dims), which is what `base` alone means. A stage
     applies RoPE with these and nothing else, so it can't run RoPE that also scales positions
     or the queries and keys themselves (linear, dynamic, YaRN)."""
-    rope = cast(object, getattr(cast(object, getattr(layer, "self_attn")), "rope"))  # noqa: B009
+    attention = next(
+        (cast(object, layer["self_attn"]) for layer in layers if "self_attn" in layer),  # noqa: B009
+        None,
+    )
+    if attention is None:
+        return mx.zeros((0,), dtype=mx.float32)
+    rope = cast(object, getattr(attention, "rope"))  # noqa: B009
     own: object = getattr(rope, "_freqs", None)
     if type(rope).__name__ == "Llama3RoPE" and isinstance(own, mx.array):
         return own.astype(mx.float32)
@@ -610,14 +712,24 @@ def rope_frequencies(layer: nn.Module, config: dict[str, object]) -> mx.array:
         raise RemoteStageError(
             f"a remote stage can't run this model's RoPE ({type(rope).__name__})"
         )
-    heads = cast(int, config["num_attention_heads"])
-    head_dim = cast(
-        int, config.get("head_dim") or cast(int, config["hidden_size"]) // heads
-    )
+    # The dimensions it rotates: all of a head's, or the first of them (Qwen3.5 rotates a
+    # quarter); the stage rotates as many as there are frequencies
+    dims = cast(int, getattr(rope, "dims"))  # noqa: B009
     base = float(cast(float, getattr(rope, "base")))  # noqa: B009
-    return mx.power(
-        mx.array(base), mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim
-    )
+    return mx.power(mx.array(base), mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+
+
+def stage_config(config: dict[str, object]) -> dict[str, object]:
+    """The config a stage reads: a multimodal checkpoint's (Qwen3.5) nests its text model's
+    under text_config, and keeps its model type and quantization at the top"""
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        return config
+    return {
+        **cast(dict[str, object], text),
+        "model_type": config.get("model_type"),
+        "quantization": config.get("quantization"),
+    }
 
 
 def stage_quantization(layers: Sequence[nn.Module]) -> dict[str, object]:
@@ -663,7 +775,7 @@ def attach_remote_stage(
     link.load(
         layers[start_layer:end_layer],
         config,
-        rope_frequencies(layers[start_layer], config),
+        rope_frequencies(layers[start_layer:end_layer]),
     )
     install_remote_stage(model, link, start_layer, end_layer)
 
@@ -696,13 +808,13 @@ def hand_layers_to_stage(
         )
     link = RemoteStageLink(*stage_address)
     add_memory_pressure_source(link.memory_used_fraction)
-    rope = rope_frequencies(layers[0], config)
+    rope = rope_frequencies(layers)
     for sent in link.load_layers(layers, config, rope):
         yield sent, len(layers)
     stage = RemoteStage(link, 0, len(layers))
 
     def make_cache() -> list[RemoteKVCache]:
-        return [RemoteKVCache(link)]
+        return [remote_cache(link)]
 
     make: Callable[[], list[RemoteKVCache]] = make_cache
     setattr(model, "make_cache", make)  # noqa: B010

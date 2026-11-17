@@ -230,16 +230,19 @@ class ArraysCache(_BaseCache):
     def state(
         self, v: tuple[list[mx.array | None], mx.array | None, mx.array | None]
     ) -> None: ...
-    def filter(self, batch_indices):  # -> None:
+    def filter(self, batch_indices: List[int] | mx.array) -> None:
         """
         In-place filter to keep just the given indices in the cache.
         """
 
-    def extend(self, other):  # -> None:
+    def extend(self, other: ArraysCache) -> None:
         """
         In-place extend this cache with the other cache.
         """
 
+    def extract(self, idx: int) -> ArraysCache: ...
+    def finalize(self) -> None: ...
+    def empty(self) -> bool: ...
     def make_mask(self, N: int) -> mx.array | None: ...
 
 class MambaCache(ArraysCache):

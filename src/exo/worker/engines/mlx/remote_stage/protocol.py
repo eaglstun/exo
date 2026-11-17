@@ -1,5 +1,6 @@
 """The frames between an exo node and a remote stage: a device that runs a range of a model's
-layers for that node, and keeps those layers' KV caches.
+layers for that node, and keeps those layers' caches: KV caches, and recurrent state for
+linear attention layers.
 
 Every frame is a little-endian u32 header length, a JSON header, then `payload_bytes` of raw
 array data. A stage starts with no layers: the node sends them in `load` frames, a layer or a
@@ -20,7 +21,7 @@ from pydantic import Field
 
 from exo.utils.pydantic_ext import FrozenModel
 
-PROTOCOL_VERSION: Final = 4
+PROTOCOL_VERSION: Final = 5
 
 Operation = Literal[
     # node -> stage
@@ -88,6 +89,10 @@ class Frame(FrozenModel):
     layer_count: int = 0
     # loaded, once it has them all: the KV cache's size per token
     kv_bytes_per_token: int = 0
+    # loaded, once it has them all: the size of one sequence's recurrent state (Qwen3.5's
+    # linear attention layers), whatever its length. 0: the stage keeps only KV caches, which
+    # trim token by token; otherwise its caches go back only to copies made earlier.
+    state_bytes: int = 0
     # counted: how many caches the stage holds
     live_caches: int = 0
     # error

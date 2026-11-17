@@ -37,7 +37,7 @@ from exo.worker.engines.mlx.remote_stage.client import (
     RemoteStageLostError,
     attach_remote_stage,
 )
-from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     load_tokenizer_for_model_id,
@@ -58,6 +58,8 @@ MODELS = [
     StagedModel(ModelId("mlx-community/Qwen3-0.6B-4bit"), 14, 28),
     # A mixture of experts: 128 experts, 8 per token
     StagedModel(ModelId("mlx-community/Qwen3-30B-A3B-4bit"), 40, 48),
+    # Qwen3.5: linear attention layers with a recurrent state, every fourth layer attention
+    StagedModel(ModelId("mlx-community/Qwen3.5-2B-MLX-8bit"), 12, 24),
 ]
 # How close, in logprob, two greedy candidates are when another GPU may pick either
 TIE_LOGPROB_GAP = 0.02
@@ -151,6 +153,22 @@ def _task(
         logprobs=True,
         top_logprobs=5,
     )
+
+
+def _record_remaining(prefix_cache: KVPrefixCache) -> list[int]:
+    """From now on, how many tokens of each prompt `prefix_cache` leaves to prefill"""
+    remaining: list[int] = []
+    get = prefix_cache.get_kv_cache
+
+    def recording(
+        *args: object, **kwargs: object
+    ) -> tuple[KVCacheType, mx.array, int | None, bool]:
+        found = get(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        remaining.append(len(found[1]))
+        return found
+
+    prefix_cache.get_kv_cache = recording
+    return remaining
 
 
 def _generate(
@@ -298,6 +316,14 @@ def test_remote_stage_generates_what_the_whole_model_does(
         ),
     ]
 
+    # How many of each prompt's tokens each prefix cache leaves to prefill: the same, whether
+    # or not the stage runs some of the layers
+    whole_remaining = _record_remaining(whole_prefix_cache)
+    staged_remaining = _record_remaining(staged_prefix_cache)
+    # A model with recurrent state goes back only to snapshots, taken at the end of each
+    # prompt: a prompt that only shares a prefix reuses nothing
+    reuses_prefixes = link.state_bytes == 0
+
     for name, task, stop_after, expect_hit in scenarios:
         prompt_length = len(
             encode_prompt(tokenizer, apply_chat_template(tokenizer, task))
@@ -312,7 +338,11 @@ def test_remote_stage_generates_what_the_whole_model_does(
             name, tokenizer, expected, actual, task, other_device=other_device
         )
         print(f"{name}: prompt {prompt_length}, stage prefilled {prefilled}: {outcome}")
-        if expect_hit:
+        assert staged_remaining[-1] == whole_remaining[-1], (
+            f"{name}: {staged_remaining[-1]} tokens left to prefill with the stage, "
+            f"{whole_remaining[-1]} without"
+        )
+        if expect_hit and (reuses_prefixes or name.endswith("exact hit")):
             assert prefilled < prompt_length // 2, (
                 f"{name}: the prefix cache wasn't used"
             )
