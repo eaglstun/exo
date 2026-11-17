@@ -50,6 +50,11 @@ from exo.utils.channels import Receiver, channel
 from exo.utils.exit_guard import exit_if_shutdown_hangs
 from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
+from exo.worker.engines.mlx.remote_stage.presence import wait_for_stage, watch_stage
+from exo.worker.engines.mlx.remote_stage.settings import (
+    configured_stage_address,
+    is_stage_proxy,
+)
 from exo.worker.main import Worker
 
 # Where the master used to keep every event of a session; removed when a node starts
@@ -98,6 +103,8 @@ class Node:
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
     # Set by the first quit signal, while the node announces its departure
     _leaving: bool = field(init=False, default=False)
+    # A proxy node whose stage stopped answering: it left, to start over once the stage is back
+    stage_lost: bool = field(init=False, default=False)
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
@@ -274,6 +281,13 @@ class Node:
             if self.cluster_routes:
                 tg.start_soon(self.cluster_routes.run)
             tg.start_soon(self._elect_loop)
+            stage = configured_stage_address() if is_stage_proxy() else None
+            if stage is not None:
+                tg.start_soon(watch_stage, *stage, self._on_stage_lost)
+
+    def _on_stage_lost(self) -> None:
+        self.stage_lost = True
+        self.shutdown()
 
     def shutdown(self):
         """Leave the cluster and stop. A second call (another Ctrl-C) exits at once."""
@@ -503,6 +517,10 @@ def main_inner(args: "Args"):
         os.environ["EXO_FAST_SYNCH"] = "false"
         logger.info("FAST_SYNCH forced OFF")
 
+    stage = configured_stage_address() if is_stage_proxy() else None
+    if stage is not None:
+        # A proxy node joins only with its stage's device there (see remote_stage.presence)
+        wait_for_stage(*stage)
     try:
         node = anyio.run(Node.create, args)
     except ApiPortInUseError as error:
@@ -511,6 +529,12 @@ def main_inner(args: "Args"):
         raise SystemExit(1) from None
     try:
         anyio.run(node.run)
+        if stage is not None and node.stage_lost:
+            # Start over, as a new node, once the stage is back
+            wait_for_stage(*stage)
+            logger.info("Restarting this proxy node")
+            logger_cleanup()
+            os.execv(sys.executable, [sys.executable, *sys.argv])
     except BaseException as exception:
         logger.opt(exception=exception).critical(
             "EXO terminated due to unhandled exception"

@@ -45,6 +45,10 @@ from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.vision import get_inner_model
 
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
+# The longest a stage may take to answer: a long prompt's chunk through many layers takes
+# seconds; a stage this slow is suspended (its iPad locked) or gone. Longer than exo's runner
+# stall timeout, which ends a silent generation first.
+ANSWER_TIMEOUT_SECONDS: Final = 120.0
 
 # The model families whose layers a stage can run: their blocks are all the same
 STAGE_MODEL_TYPES: Final = frozenset({"llama"})
@@ -54,16 +58,28 @@ class RemoteStageError(RuntimeError):
     pass
 
 
+class RemoteStageLost(RemoteStageError):
+    """The connection to the stage broke, or it stopped answering: its app quit or was
+    suspended, or the cable came out. Its caches are gone with it."""
+
+
 @final
 class RemoteStageLink:
     """One connection to a stage. Frees requested by garbage collection wait for the next
     operation, so they never write to the socket from inside another write."""
 
     def __init__(self, host: str, port: int):
-        self._socket = socket.create_connection(
-            (host, port), timeout=CONNECT_TIMEOUT_SECONDS
-        )
-        self._socket.settimeout(None)
+        self.address: Final = f"{host}:{port}"
+        try:
+            self._socket = socket.create_connection(
+                (host, port), timeout=CONNECT_TIMEOUT_SECONDS
+            )
+        except OSError as error:
+            raise RemoteStageLost(
+                f"can't reach the remote stage at {self.address} ({error}): is its app "
+                f"open, in front, and the device unlocked?"
+            ) from error
+        self._socket.settimeout(ANSWER_TIMEOUT_SECONDS)
         self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._lock = threading.Lock()
         self._next_handle = 1
@@ -130,16 +146,29 @@ class RemoteStageLink:
                 self.kv_bytes_per_token = loaded.kv_bytes_per_token
 
     def _send(self, frame: Frame, payload: bytes = b"") -> None:
-        while self._unfreed:
-            send_frame(
-                self._socket, Frame(operation="free", handle=self._unfreed.popleft())
-            )
-        send_frame(self._socket, frame, payload)
+        try:
+            while self._unfreed:
+                send_frame(
+                    self._socket,
+                    Frame(operation="free", handle=self._unfreed.popleft()),
+                )
+            send_frame(self._socket, frame, payload)
+        except OSError as error:
+            raise self._lost(error) from error
+
+    def _lost(self, error: OSError) -> RemoteStageLost:
+        return RemoteStageLost(
+            f"the remote stage at {self.address} went away "
+            f"({type(error).__name__}: {error})"
+        )
 
     def _request(self, frame: Frame, payload: bytes = b"") -> tuple[Frame, bytes]:
         with self._lock:
             self._send(frame, payload)
-            answer, answer_payload = receive_frame(self._socket)
+            try:
+                answer, answer_payload = receive_frame(self._socket)
+            except OSError as error:
+                raise self._lost(error) from error
         if answer.operation == "error":
             raise RemoteStageError(answer.message)
         return answer, answer_payload
