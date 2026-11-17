@@ -233,8 +233,8 @@ _ADDRESS_PRIORITY: Final = {
 def node_urls(state: State, source: NodeId, sink: NodeId, api_port: int) -> list[str]:
     """Base URLs at which `source` can try to reach `sink`'s API, best first: the addresses
     source has verified (its reachability probe of sink's API), then sink's other addresses.
-    IPv4 only: the API listens on IPv4 (exo.api.listening_socket). Every node of a cluster
-    serves its API on the same port, as the reachability probe assumes."""
+    IPv4 only: the API listens on IPv4 (exo.api.listening_socket). Sink is reached at the API
+    port it advertises; `api_port`, source's own, is the guess for a sink that hasn't said."""
     interfaces = state.node_network.get(sink)
     types = (
         {iface.ip_address: iface.interface_type for iface in interfaces.interfaces}
@@ -253,7 +253,8 @@ def node_urls(state: State, source: NodeId, sink: NodeId, api_port: int) -> list
     addresses = sorted(filter(usable, verified), key=rank) + sorted(
         filter(usable, others), key=rank
     )
-    return [f"http://{address}:{api_port}" for address in addresses]
+    port = interfaces.api_port if interfaces is not None else api_port
+    return [f"http://{address}:{port}" for address in addresses]
 
 
 def _is_ipv4(address: str) -> bool:

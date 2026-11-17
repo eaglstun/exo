@@ -43,6 +43,7 @@ from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.serving import ServingReachability
 from exo.shared.types.common import NodeId, SessionId
 from exo.shared.types.events import NodeLeft
+from exo.shared.types.profiling import DEFAULT_API_PORT
 from exo.shared.types.state import State
 from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
@@ -539,7 +540,7 @@ class Args(FrozenModel):
     verbosity: int = 0
     force_master: bool = False
     spawn_api: bool = False
-    api_port: PositiveInt = 52415
+    api_port: PositiveInt = DEFAULT_API_PORT
     tb_only: bool = False
     no_worker: bool = False
     no_downloads: bool = False
@@ -599,7 +600,7 @@ class Args(FrozenModel):
             "--api-port",
             type=int,
             dest="api_port",
-            default=52415,
+            default=DEFAULT_API_PORT,
             help="Port for the dashboard and API (default: %(default)s)",
         )
         parser.add_argument(

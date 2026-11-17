@@ -2982,6 +2982,9 @@
     "NodeNetworkInfo": {
       "additionalProperties": false,
       "properties": {
+        "api_port": {
+          "type": "integer"
+        },
         "interfaces": {
           "items": {
             "$ref": "#/$defs/NetworkInterfaceInfo"
@@ -2999,6 +3002,9 @@
         "NodeNetworkInterfaces": {
           "additionalProperties": false,
           "properties": {
+            "api_port": {
+              "type": "integer"
+            },
             "ifaces": {
               "items": {
                 "$ref": "#/$defs/NetworkInterfaceInfo"

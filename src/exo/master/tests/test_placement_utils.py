@@ -4,6 +4,7 @@ from exo.master.placement_utils import (
     allocate_layers_proportionally,
     filter_cycles_by_memory,
     get_mlx_jaccl_coordinators,
+    get_mlx_ring_hosts_by_node,
     get_shard_assignments,
     get_shard_assignments_for_pipeline_parallel,
     get_smallest_cycles,
@@ -15,18 +16,19 @@ from exo.master.tests.conftest import (
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.topology import Topology
 from exo.shared.types.backends import Backend
-from exo.shared.types.common import NodeId
+from exo.shared.types.common import Host, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
     NetworkInterfaceInfo,
     NodeNetworkInfo,
 )
-from exo.shared.types.topology import Connection, SocketConnection
+from exo.shared.types.topology import Connection, Cycle, SocketConnection
 from exo.shared.types.worker.shards import (
     CfgShardMetadata,
     PipelineShardMetadata,
     Sharding,
 )
+from exo.utils.ports import random_ephemeral_port
 
 
 def test_filter_cycles_by_memory():
@@ -689,3 +691,46 @@ class TestCfgParallelPlacement:
         # First shard starts at 0, last shard ends at 57
         assert layer_ranges[0][0] == 0
         assert layer_ranges[-1][1] == 57
+
+
+def test_ring_ranks_sharing_a_machine_listen_on_their_own_ports():
+    """A proxy node beside a full one: both at one address, so each rank needs its own port"""
+    full, proxy = NodeId(), NodeId()
+    shared_address = "169.254.0.7"
+    topology = Topology()
+    for source, sink, port in ((full, proxy, 52416), (proxy, full, 52415)):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=create_socket_connection(7, sink_port=port),
+            )
+        )
+    machine = NodeNetworkInfo(
+        interfaces=[NetworkInterfaceInfo(name="en0", ip_address=shared_address)]
+    )
+
+    hosts = get_mlx_ring_hosts_by_node(
+        selected_cycle=Cycle(node_ids=[full, proxy]),
+        cycle_digraph=topology,
+        ephemeral_port=50000,
+        node_network={full: machine, proxy: machine},
+    )
+
+    assert hosts[full] == [
+        Host(ip="0.0.0.0", port=50000),
+        Host(ip=shared_address, port=50001),
+    ]
+    assert hosts[proxy] == [
+        Host(ip=shared_address, port=50000),
+        Host(ip="0.0.0.0", port=50001),
+    ]
+
+
+@pytest.mark.parametrize("span", [1, 2, 8])
+def test_random_ephemeral_ports_leave_room_for_every_rank(span: int):
+    for _ in range(2000):
+        port = random_ephemeral_port(span=span)
+        ports = range(port, port + span)
+        assert port >= 49153 and ports[-1] <= 65535
+        assert not set(ports) & {52413, 52414, 52415}

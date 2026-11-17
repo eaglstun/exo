@@ -529,7 +529,7 @@ def place_instance(
                 jaccl_coordinators=mlx_jaccl_coordinators,
             )
         case InstanceMeta.MlxRing:
-            ephemeral_port = random_ephemeral_port()
+            ephemeral_port = random_ephemeral_port(span=len(selected_cycle))
             hosts_by_node = get_mlx_ring_hosts_by_node(
                 selected_cycle=selected_cycle,
                 cycle_digraph=cycle_digraph,

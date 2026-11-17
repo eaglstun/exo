@@ -17,6 +17,7 @@ from exo.shared.constants import EXO_CONFIG_FILE, EXO_DEFAULT_MODELS_DIR
 from exo.shared.types.backends import Backend
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
+    DEFAULT_API_PORT,
     DiskUsage,
     MemoryUsage,
     NetworkInterfaceInfo,
@@ -30,6 +31,10 @@ from exo.shared.types.thunderbolt import (
 from exo.utils.channels import Sender
 from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
+from exo.worker.engines.mlx.remote_stage.settings import (
+    configured_stage_address,
+    is_stage_proxy,
+)
 
 from .macmon import MacmonMetrics
 from .system_info import (
@@ -201,6 +206,8 @@ class StaticNodeInformation(TaggedModel):
 
 class NodeNetworkInterfaces(TaggedModel):
     ifaces: Sequence[NetworkInterfaceInfo]
+    # The port this node's API listens on
+    api_port: int = DEFAULT_API_PORT
 
 
 class MacThunderboltIdentifiers(TaggedModel):
@@ -403,6 +410,7 @@ GatheredInfo = (
 @dataclass
 class InfoGatherer:
     info_sender: Sender[GatheredInfo]
+    api_port: int = DEFAULT_API_PORT
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
     _psutil_enabled: bool = field(init=False, default=False)
     _gpu_working_set: Memory | None = field(init=False, default=None)
@@ -449,16 +457,22 @@ class InfoGatherer:
         except Exception as e:
             logger.opt(exception=e).warning("Error reading the GPU's working set")
         async with self._tg as tg:
-            if IS_DARWIN:
+            stage_address = configured_stage_address() if is_stage_proxy() else None
+            if stage_address is not None:
+                # A proxy node: the memory and identity it reports are its stage's device's,
+                # and that device has no Thunderbolt links of this machine's
+                tg.start_soon(self._monitor_remote_stage, *stage_address, 2)
+            elif IS_DARWIN:
                 tg.start_soon(self._monitor_macmon, 1)
                 tg.start_soon(self._monitor_system_profiler_thunderbolt_data, 5)
                 tg.start_soon(self._monitor_thunderbolt_bridge_status, 10)
                 tg.start_soon(self._monitor_rdma_ctl_status, 10)
-            if not IS_DARWIN:
+            else:
                 tg.start_soon(self._monitor_memory_usage, 1)
+            if stage_address is None:
+                tg.start_soon(self._monitor_static_info, 60)
             tg.start_soon(self._watch_system_info, 10)
             tg.start_soon(self._monitor_misc, 60)
-            tg.start_soon(self._monitor_static_info, 60)
             tg.start_soon(self._monitor_disk_usage, 30)
 
             nc = await NodeConfig.gather()
@@ -469,6 +483,40 @@ class InfoGatherer:
 
     def shutdown(self):
         self._tg.cancel_tasks()
+
+    async def _monitor_remote_stage(self, host: str, port: int, poll_interval: float):
+        """A proxy node's memory and identity: what its stage's device says in its welcome"""
+        # Imported here: only a proxy node, which runs MLX anyway, needs the stage's protocol
+        from exo.worker.engines.mlx.remote_stage.client import greet_stage
+
+        identified = False
+        while True:
+            try:
+                with fail_after(15):
+                    welcome = await to_thread.run_sync(greet_stage, host, port)
+                await self.info_sender.send(
+                    MemoryUsage.from_bytes(
+                        ram_total=welcome.memory_total,
+                        ram_available=welcome.memory_available,
+                        swap_total=0,
+                        swap_available=0,
+                    )
+                )
+                if not identified:
+                    await self.info_sender.send(
+                        StaticNodeInformation(
+                            model=welcome.device_model,
+                            chip=f"remote stage at {host}",
+                            os_version="",
+                            os_build_version="",
+                        )
+                    )
+                    identified = True
+            except Exception as e:
+                logger.opt(exception=e).warning(
+                    f"Error reaching the remote stage at {host}:{port}"
+                )
+            await anyio.sleep(poll_interval)
 
     async def _monitor_static_info(self, static_info_poll_interval: float):
         while True:
@@ -541,7 +589,9 @@ class InfoGatherer:
             try:
                 with fail_after(10):
                     nics = await get_network_interfaces()
-                    await self.info_sender.send(NodeNetworkInterfaces(ifaces=nics))
+                    await self.info_sender.send(
+                        NodeNetworkInterfaces(ifaces=nics, api_port=self.api_port)
+                    )
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering network interfaces")
             await anyio.sleep(interface_watcher_interval)

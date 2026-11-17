@@ -12,7 +12,7 @@ import socket
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Iterator, Sequence
 from pathlib import Path
 from typing import Final, cast, final
 
@@ -31,16 +31,19 @@ from exo.worker.engines.mlx.remote_stage.protocol import (
     receive_frame,
     send_frame,
 )
+from exo.worker.engines.mlx.remote_stage.settings import (
+    REMOTE_STAGE_ENV,
+    REMOTE_STAGE_LAYERS_ENV,
+    configured_stage_address,
+    is_stage_proxy,
+)
+from exo.worker.engines.mlx.sharding.blocks import LayerCallable
 from exo.worker.engines.mlx.sharding.pipeline import get_layers
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.vision import get_inner_model
 
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 
-# host:port of a stage this node hands part of its layers to
-REMOTE_STAGE_ENV: Final = "EXO_REMOTE_STAGE"
-# How many layers it takes (default: half of this node's)
-REMOTE_STAGE_LAYERS_ENV: Final = "EXO_REMOTE_STAGE_LAYERS"
 # The model families whose layers a stage can run: their blocks are all the same
 STAGE_MODEL_TYPES: Final = frozenset({"llama"})
 
@@ -74,6 +77,8 @@ class RemoteStageLink:
             raise RemoteStageError(
                 f"the stage speaks protocol {welcome.protocol_version}, not {PROTOCOL_VERSION}"
             )
+        # What the stage's device is, and its memory when it said hello
+        self.welcome: Final = welcome
         # Set by load
         self.layer_count = 0
         self.kv_bytes_per_token = 0
@@ -81,31 +86,46 @@ class RemoteStageLink:
     def load(
         self, layers: list[nn.Module], config: dict[str, object], rope_freqs: mx.array
     ) -> None:
-        """Send the stage these layers' weights, renamed layers.0.., to run from now on."""
-        weights: dict[str, mx.array] = {"rope_freqs": rope_freqs}
+        """Send the stage these layers' weights to run from now on."""
+        for _ in self.load_layers(layers, config, rope_freqs):
+            pass
+
+    def load_layers(
+        self, layers: list[nn.Module], config: dict[str, object], rope_freqs: mx.array
+    ) -> Iterator[int]:
+        """Send the stage these layers' weights, one layer per frame, yielding how many it
+        has after each. Only one layer at a time is read into memory here: from a lazily
+        loaded model, the rest never are."""
+        config_json = json.dumps(config)
         for index, layer in enumerate(layers):
-            for name, array in cast(
-                list[tuple[str, mx.array]], tree_flatten(layer.parameters())
-            ):
-                weights[f"layers.{index}.{name}"] = array
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "stage.safetensors"
-            mx.save_safetensors(str(path), weights)  # pyright: ignore[reportUnknownMemberType]
-            payload = path.read_bytes()
-        loaded = self._request(
-            Frame(
-                operation="load",
-                config_json=json.dumps(config),
-                payload_bytes=len(payload),
-            ),
-            payload,
-        )[0]
-        if loaded.layer_count != len(layers):
-            raise RemoteStageError(
-                f"the stage loaded {loaded.layer_count} layers, not {len(layers)}"
-            )
-        self.layer_count = loaded.layer_count
-        self.kv_bytes_per_token = loaded.kv_bytes_per_token
+            weights: dict[str, mx.array] = {
+                f"layers.{index}.{name}": array
+                for name, array in cast(
+                    list[tuple[str, mx.array]], tree_flatten(layer.parameters())
+                )
+            }
+            if index == 0:
+                weights["rope_freqs"] = rope_freqs
+            payload = _safetensors_bytes(weights)
+            del weights
+            loaded = self._request(
+                Frame(
+                    operation="load",
+                    offset=index,
+                    layer_count=len(layers),
+                    config_json=config_json,
+                    payload_bytes=len(payload),
+                ),
+                payload,
+            )[0]
+            if loaded.layer_count != index + 1:
+                raise RemoteStageError(
+                    f"the stage has {loaded.layer_count} layers, not {index + 1}"
+                )
+            yield loaded.layer_count
+            if loaded.layer_count == len(layers):
+                self.layer_count = loaded.layer_count
+                self.kv_bytes_per_token = loaded.kv_bytes_per_token
 
     def _send(self, frame: Frame, payload: bytes = b"") -> None:
         while self._unfreed:
@@ -168,6 +188,30 @@ class RemoteStageLink:
 
     def close(self) -> None:
         self._socket.close()
+
+
+def _safetensors_bytes(weights: dict[str, mx.array]) -> bytes:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "layer.safetensors"
+        mx.save_safetensors(str(path), weights)  # pyright: ignore[reportUnknownMemberType]
+        return path.read_bytes()
+
+
+def greet_stage(host: str, port: int) -> Frame:
+    """The stage's welcome: its device and memory now. A connection of its own: the stage
+    serves each connection apart, so this can ask while a runner's link is busy."""
+    with socket.create_connection(
+        (host, port), timeout=CONNECT_TIMEOUT_SECONDS
+    ) as connection:
+        send_frame(
+            connection, Frame(operation="hello", protocol_version=PROTOCOL_VERSION)
+        )
+        welcome, _ = receive_frame(connection)
+    if welcome.protocol_version != PROTOCOL_VERSION:
+        raise RemoteStageError(
+            f"the stage speaks protocol {welcome.protocol_version}, not {PROTOCOL_VERSION}"
+        )
+    return welcome
 
 
 @final
@@ -335,18 +379,62 @@ def attach_remote_stage(
     install_remote_stage(model, link, start_layer, end_layer)
 
 
-def attach_configured_remote_stage(model: Model, model_path: Path) -> None:
-    """With EXO_REMOTE_STAGE set, hand part of this node's layers to that stage: by default the
-    back half, short of the last layer, so a pipeline's first and last layer stay here."""
-    address = os.environ.get(REMOTE_STAGE_ENV)
-    if not address:
-        return
+def _stage_config(model_path: Path) -> dict[str, object]:
+    """The model's config, once checked that a stage can run its layers here"""
     # The batch generator merges caches into BatchKVCaches, which a stage can't hold yet
     if not os.environ.get("EXO_NO_BATCH"):
         raise RemoteStageError(f"{REMOTE_STAGE_ENV} needs EXO_NO_BATCH=1")
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
+    if config.get("model_type") not in STAGE_MODEL_TYPES:
+        raise RemoteStageError(
+            f"a remote stage can't run {config.get('model_type')} layers yet"
+        )
+    return config
+
+
+def hand_layers_to_stage(
+    model: nn.Module, given_layers: Sequence[LayerCallable], model_path: Path
+) -> Generator[tuple[int, int], None, list[LayerCallable]]:
+    """On a proxy node: send all of `layers` (this node's share of the model, not yet
+    evaluated) to the stage, yielding (layers sent, of how many), and return what runs in
+    their place: one RemoteStage. Gives `model` a make_cache with its RemoteKVCache."""
+    stage_address = configured_stage_address()
+    assert stage_address is not None
+    config = _stage_config(model_path)
+    layers = cast(list[nn.Module], list(given_layers))
+    if any(getattr(layer, "use_sliding", False) for layer in layers):
+        raise RemoteStageError(
+            "a remote stage can't run sliding-window attention layers"
+        )
+    link = RemoteStageLink(*stage_address)
+    rope = rope_frequencies(layers[0], config)
+    for sent in link.load_layers(layers, config, rope):
+        yield sent, len(layers)
+    stage = RemoteStage(link, 0, len(layers))
+
+    def make_cache() -> list[RemoteKVCache]:
+        return [RemoteKVCache(link)]
+
+    make: Callable[[], list[RemoteKVCache]] = make_cache
+    setattr(model, "make_cache", make)  # noqa: B010
+    logger.info(
+        f"remote stage {stage_address[0]}:{stage_address[1]} "
+        f"({link.welcome.device_model}) runs all {len(layers)} of this node's layers"
+    )
+    # Its call names mask and cache, which LayerCallable leaves open
+    return [cast(LayerCallable, cast(object, stage))]
+
+
+def attach_configured_remote_stage(model: Model, model_path: Path) -> None:
+    """With EXO_REMOTE_STAGE set, hand part of this node's layers to that stage: by default the
+    back half, short of the last layer, so a pipeline's first and last layer stay here. A
+    proxy node has already handed over all of them (hand_layers_to_stage)."""
+    address = os.environ.get(REMOTE_STAGE_ENV)
+    if not address or is_stage_proxy():
+        return
+    config = _stage_config(model_path)
     layer_count = len(get_layers(get_inner_model(model)))  # pyright: ignore[reportAny]
     wanted = int(os.environ.get(REMOTE_STAGE_LAYERS_ENV) or layer_count // 2)
     count = max(0, min(wanted, layer_count - 2))

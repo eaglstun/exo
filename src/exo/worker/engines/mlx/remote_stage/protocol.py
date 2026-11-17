@@ -2,8 +2,10 @@
 layers for that node, and keeps those layers' KV caches.
 
 Every frame is a little-endian u32 header length, a JSON header, then `payload_bytes` of raw
-array data. A stage starts with no layers: the node sends them in `load`, as safetensors bytes
-with the model's config. The node names each cache by a handle it picks itself, so only
+array data. A stage starts with no layers: the node sends them in `load` frames, a layer or a
+few at a time, as safetensors bytes with the model's config, so neither side ever holds a
+second copy of them all. `welcome` says what the stage's device is and how much memory it has,
+which a proxy node reports to the cluster as its own. The node names each cache by a handle it picks itself, so only
 `hello`, `load`, `forward` and `stats` wait for an answer: every other operation is sent and
 the stage applies it in order.
 """
@@ -18,7 +20,7 @@ from pydantic import Field
 
 from exo.utils.pydantic_ext import FrozenModel
 
-PROTOCOL_VERSION: Final = 2
+PROTOCOL_VERSION: Final = 3
 
 Operation = Literal[
     # node -> stage
@@ -45,19 +47,27 @@ class Frame(FrozenModel):
     handle: int = 0
     # copy: the cache to copy
     source: int = 0
-    # truncate: the cache's new length in tokens
+    # truncate: the cache's new length in tokens. load: the index, among the stage's layers,
+    # of the first layer in this frame; 0 starts a new set of layers
     offset: int = 0
     # forward and hidden: the array that follows the header
     shape: list[int] = Field(default_factory=list)
     dtype: str = ""
     payload_bytes: int = 0
-    # welcome
+    # hello and welcome
     protocol_version: int = 0
-    # load: the model's config.json; its payload is the layers' weights (renamed layers.0..)
-    # and `rope_freqs`, as safetensors
+    # welcome: the stage's device (its model identifier, e.g. iPad17,1), all its memory, and
+    # how much of that the stage itself can still allocate
+    device_model: str = ""
+    memory_total: int = 0
+    memory_available: int = 0
+    # load: the model's config.json; its payload is these layers' weights (named layers.N..,
+    # N counted from the stage's first layer) and, in the first frame, `rope_freqs`, as
+    # safetensors
     config_json: str = ""
-    # loaded
+    # load: how many layers the stage will run. loaded: how many it has so far
     layer_count: int = 0
+    # loaded, once it has them all: the KV cache's size per token
     kv_bytes_per_token: int = 0
     # counted: how many caches the stage holds
     live_caches: int = 0

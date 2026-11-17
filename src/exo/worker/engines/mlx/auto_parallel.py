@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from functools import partial
+from typing import cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,6 +9,7 @@ from mlx.nn.layers.distributed import (
     shard_linear,
 )
 
+from exo.download.download_utils import build_model_path
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
 from exo.worker.engines.mlx.models.family import Architecture
@@ -51,11 +53,23 @@ def pipeline_auto_parallel(
     device_rank, world_size = model_shard_meta.device_rank, model_shard_meta.world_size
 
     layers = layers[start_layer:end_layer]
-    total = len(layers)
-    for i, layer in enumerate(layers):
-        mx.eval(layer)  # type: ignore
-        mx.clear_cache()
-        yield ModelLoadingResponse(layers_loaded=i, total=total)
+    # Imported here: the remote stage's client imports modules that import this one
+    from exo.worker.engines.mlx.remote_stage.client import hand_layers_to_stage
+    from exo.worker.engines.mlx.remote_stage.settings import is_stage_proxy
+
+    if is_stage_proxy():
+        # A proxy node: its layers run on the stage's device, never here
+        layers = yield from with_loading_progress(
+            hand_layers_to_stage(
+                model, layers, build_model_path(model_shard_meta.model_card.model_id)
+            )
+        )
+    else:
+        total = len(layers)
+        for i, layer in enumerate(layers):
+            mx.eval(layer)  # type: ignore
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
 
     layers[0] = PipelineFirstLayer(layers[0], device_rank, group=group)
     layers[-1] = PipelineLastLayer(
@@ -77,6 +91,18 @@ def pipeline_auto_parallel(
     )
 
     return patch_pipeline_model(model, group)
+
+
+def with_loading_progress[T](
+    steps: Generator[tuple[int, int], None, T],
+) -> Generator[ModelLoadingResponse, None, T]:
+    """Report each (done, of total) step as loading progress"""
+    while True:
+        try:
+            done, total = next(steps)
+        except StopIteration as finished:
+            return cast(T, finished.value)
+        yield ModelLoadingResponse(layers_loaded=done, total=total)
 
 
 def tensor_auto_parallel(

@@ -2,20 +2,24 @@
 
     python -m exo.worker.engines.mlx.remote_stage.server [--host 127.0.0.1] [--port 5560]
 
-It starts with no layers: a node sends them in `load`. Serves one node at a time. Each cache
-handle is a list of mlx-lm KVCaches, one per layer.
+It starts with no layers: a node sends them in `load` frames. Serves each connection on its
+own thread, with its own layers and caches. Each cache handle is a list of mlx-lm KVCaches,
+one per layer.
 """
 
 import argparse
 import json
+import platform
 import socket
 import tempfile
+import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Final, cast, final
 
 import mlx.core as mx
 import mlx.nn as nn
+import psutil
 from loguru import logger
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.llama import ModelArgs, TransformerBlock
@@ -88,9 +92,23 @@ def _load_weights(payload: bytes) -> dict[str, mx.array]:
         return cast(dict[str, mx.array], mx.load(str(path)))
 
 
+def _welcome() -> Frame:
+    memory = psutil.virtual_memory()
+    return Frame(
+        operation="welcome",
+        protocol_version=PROTOCOL_VERSION,
+        device_model=f"Python stage on {platform.node()}",
+        memory_total=memory.total,
+        memory_available=memory.available,
+    )
+
+
 def serve_connection(connection: socket.socket) -> None:
     stage: StageLayers | None = None
     caches: dict[int, list[KVCache]] = {}
+    # The layers a load has sent so far, and how many it will send
+    arriving: dict[str, mx.array] = {}
+    expected_layers = 0
 
     def error(message: str) -> None:
         send_frame(connection, Frame(operation="error", message=message))
@@ -103,23 +121,35 @@ def serve_connection(connection: socket.socket) -> None:
             return
         match frame.operation:
             case "hello":
-                send_frame(
-                    connection,
-                    Frame(operation="welcome", protocol_version=PROTOCOL_VERSION),
-                )
+                send_frame(connection, _welcome())
             case "load":
-                caches.clear()
-                stage = StageLayers(
-                    cast(dict[str, object], json.loads(frame.config_json)),
-                    _load_weights(payload),
+                if frame.offset == 0:
+                    caches.clear()
+                    arriving.clear()
+                    stage = None
+                    expected_layers = frame.layer_count
+                weights = _load_weights(payload)
+                mx.eval(list(weights.values()))
+                arriving.update(weights)
+                received = len(
+                    {
+                        name.split(".")[1]
+                        for name in arriving
+                        if name.startswith("layers.")
+                    }
                 )
-                logger.info(f"loaded {len(stage.layers)} layers")
+                if received == expected_layers:
+                    stage = StageLayers(
+                        cast(dict[str, object], json.loads(frame.config_json)), arriving
+                    )
+                    arriving = {}
+                    logger.info(f"loaded {len(stage.layers)} layers")
                 send_frame(
                     connection,
                     Frame(
                         operation="loaded",
-                        layer_count=len(stage.layers),
-                        kv_bytes_per_token=stage.kv_bytes_per_token,
+                        layer_count=received,
+                        kv_bytes_per_token=stage.kv_bytes_per_token if stage else 0,
                     ),
                 )
             case "new":
@@ -176,8 +206,12 @@ def main() -> None:
         connection, address = cast(tuple[socket.socket, object], listener.accept())
         connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         logger.info(f"node connected from {address}")
-        with connection:
-            serve_connection(connection)
+        threading.Thread(target=_serve, args=(connection,), daemon=True).start()
+
+
+def _serve(connection: socket.socket) -> None:
+    with connection:
+        serve_connection(connection)
 
 
 if __name__ == "__main__":
