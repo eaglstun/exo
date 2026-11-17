@@ -251,6 +251,7 @@ def load_mlx_items(
             )
         mx.eval(model)
         run_post_load(model, model_path)
+        _attach_configured_remote_stage(model, model_path)
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
@@ -292,6 +293,16 @@ def load_mlx_items(
         vision_processor = None
 
     return cast(Model, model), tokenizer, vision_processor
+
+
+def _attach_configured_remote_stage(model: nn.Module, model_path: Path) -> None:
+    """Hand part of this node's layers to EXO_REMOTE_STAGE, if set (see remote_stage)."""
+    # Imported here: the remote stage's client imports modules that import this one
+    from exo.worker.engines.mlx.remote_stage.client import (
+        attach_configured_remote_stage,
+    )
+
+    attach_configured_remote_stage(cast(Model, model), model_path)
 
 
 def run_post_load(model: nn.Module, model_path: Path) -> None:
@@ -349,6 +360,7 @@ def shard_and_load(
     # TODO: Do we need this?
     mx.eval(model)
     run_post_load(model, model_path)
+    _attach_configured_remote_stage(model, model_path)
 
     logger.debug("SHARDED")
     logger.debug(model)

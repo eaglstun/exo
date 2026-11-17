@@ -2,8 +2,10 @@
 layers for that node, and keeps those layers' KV caches.
 
 Every frame is a little-endian u32 header length, a JSON header, then `payload_bytes` of raw
-array data. The node names each cache by a handle it picks itself, so only `hello` and
-`forward` wait for an answer: every other operation is sent and the stage applies it in order.
+array data. A stage starts with no layers: the node sends them in `load`, as safetensors bytes
+with the model's config. The node names each cache by a handle it picks itself, so only
+`hello`, `load`, `forward` and `stats` wait for an answer: every other operation is sent and
+the stage applies it in order.
 """
 
 import socket
@@ -16,11 +18,12 @@ from pydantic import Field
 
 from exo.utils.pydantic_ext import FrozenModel
 
-PROTOCOL_VERSION: Final = 1
+PROTOCOL_VERSION: Final = 2
 
 Operation = Literal[
     # node -> stage
     "hello",
+    "load",
     "new",
     "forward",
     "truncate",
@@ -29,6 +32,7 @@ Operation = Literal[
     "stats",
     # stage -> node
     "welcome",
+    "loaded",
     "hidden",
     "counted",
     "error",
@@ -49,6 +53,10 @@ class Frame(FrozenModel):
     payload_bytes: int = 0
     # welcome
     protocol_version: int = 0
+    # load: the model's config.json; its payload is the layers' weights (renamed layers.0..)
+    # and `rope_freqs`, as safetensors
+    config_json: str = ""
+    # loaded
     layer_count: int = 0
     kv_bytes_per_token: int = 0
     # counted: how many caches the stage holds

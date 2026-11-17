@@ -4,6 +4,7 @@ sampled request and an abandoned one. Needs Llama-3.2-1B-Instruct-4bit downloade
 """
 
 import gc
+import json
 import os
 import socket
 import subprocess
@@ -11,6 +12,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import mlx.core as mx
 import pytest
@@ -29,7 +31,7 @@ from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt
 from exo.worker.engines.mlx.generator.generate import mlx_generate
 from exo.worker.engines.mlx.remote_stage.client import (
     RemoteStageLink,
-    install_remote_stage,
+    attach_remote_stage,
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
@@ -82,9 +84,6 @@ def link(model_path: Path) -> Iterator[RemoteStageLink]:
             sys.executable,
             "-m",
             "exo.worker.engines.mlx.remote_stage.server",
-            str(model_path),
-            str(START_LAYER),
-            str(END_LAYER),
             "--port",
             str(port),
         ]
@@ -203,7 +202,10 @@ def test_remote_stage_generates_what_the_whole_model_does(
     tokenizer = load_tokenizer_for_model_id(MODEL_ID, model_path)
     whole, _ = load_model(model_path)
     staged, _ = load_model(model_path)
-    install_remote_stage(staged, link, START_LAYER, END_LAYER)  # pyright: ignore[reportArgumentType]
+    config = cast(
+        dict[str, object], json.loads((model_path / "config.json").read_text())
+    )
+    attach_remote_stage(staged, link, START_LAYER, END_LAYER, config)  # pyright: ignore[reportArgumentType]
     whole_prefix_cache = KVPrefixCache(None)
     staged_prefix_cache = KVPrefixCache(None)
     # The Python reference stage runs on this GPU, so its tokens must match exactly
