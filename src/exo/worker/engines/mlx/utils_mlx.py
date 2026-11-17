@@ -78,7 +78,11 @@ from exo.worker.engines.mlx.auto_parallel import (
     with_loading_progress,
 )
 from exo.worker.engines.mlx.sharding.blocks import LayerCallable
-from exo.worker.engines.mlx.sharding.pipeline import get_inner_model, get_layers
+from exo.worker.engines.mlx.sharding.pipeline import (
+    get_inner_model,
+    get_layers,
+    set_pipeline_wire_dtype,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
@@ -239,6 +243,7 @@ def load_mlx_items(
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
         model = load_model_checked(model_path)
+        upcast_for_cpu(model)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -301,6 +306,29 @@ def load_mlx_items(
         vision_processor = None
 
     return cast(Model, model), tokenizer, vision_processor
+
+
+def upcast_for_cpu(model: nn.Module) -> mx.Dtype | None:
+    """On the CPU backend, compute in float32: there a half-precision quantized matmul runs
+    8x (bfloat16) to 40x (float16) slower than a float32 one (measured on a Raspberry Pi 5),
+    which makes a layer take seconds per token. Quantized weights stay packed; only their
+    scales and biases and the unquantized parameters widen. Returns the checkpoint's half
+    dtype, the one ranks keep exchanging hidden states in, or None if nothing changed."""
+    if mx.default_device() != mx.Device(mx.cpu):
+        return None
+    half_dtypes = {
+        parameter.dtype
+        for _, parameter in cast(
+            list[tuple[str, mx.array]], tree_flatten(model.parameters())
+        )
+        if parameter.dtype in (mx.float16, mx.bfloat16)
+    }
+    if not half_dtypes:
+        return None
+    checkpoint_dtype = mx.float16 if mx.float16 in half_dtypes else mx.bfloat16
+    model.set_dtype(mx.float32)  # pyright: ignore[reportUnknownMemberType]
+    logger.info(f"CPU backend: computing in float32 instead of {checkpoint_dtype}")
+    return checkpoint_dtype
 
 
 def _is_stage_proxy() -> bool:
@@ -378,6 +406,8 @@ def shard_and_load(
         case PipelineShardMetadata():
             logger.info(f"loading model from {model_path} with pipeline parallelism")
             model = yield from pipeline_auto_parallel(model, group, shard_metadata)
+            if (checkpoint_dtype := upcast_for_cpu(model)) is not None:
+                set_pipeline_wire_dtype(model, checkpoint_dtype)
             mx.eval(model.parameters())
         case CfgShardMetadata():
             raise ValueError(
