@@ -1,0 +1,282 @@
+"""A model whose layers 8..15 run on a remote stage generates exactly what the whole model does,
+through exo's own generator and prefix cache: a miss, a partial hit (trim), an exact hit, a
+sampled request and an abandoned one. Needs Llama-3.2-1B-Instruct-4bit downloaded.
+"""
+
+import gc
+import os
+import socket
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import mlx.core as mx
+import pytest
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.utils import load_model
+
+from exo.download.download_utils import resolve_existing_model
+from exo.shared.types.common import ModelId
+from exo.shared.types.text_generation import (
+    InputMessage,
+    InputMessageContent,
+    TextGenerationTaskParams,
+)
+from exo.shared.types.worker.runner_response import GenerationResponse
+from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt
+from exo.worker.engines.mlx.generator.generate import mlx_generate
+from exo.worker.engines.mlx.remote_stage.client import (
+    RemoteStageLink,
+    install_remote_stage,
+)
+from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.utils_mlx import (
+    apply_chat_template,
+    load_tokenizer_for_model_id,
+)
+
+MODEL_ID = ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit")
+# How close, in logprob, two greedy candidates are when another GPU may pick either
+TIE_LOGPROB_GAP = 0.02
+START_LAYER = 8
+END_LAYER = 16
+
+# Over 1000 tokens, the least prefix mlx_generate reuses from the prefix cache
+LONG_CONTEXT = " ".join(
+    f"Box {number} holds {number * 7 % 13} {['red', 'green', 'blue', 'amber'][number % 4]} marbles."
+    for number in range(1, 141)
+)
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])  # pyright: ignore[reportAny]
+
+
+@pytest.fixture(scope="module")
+def model_path() -> Path:
+    path = resolve_existing_model(MODEL_ID)
+    if path is None:
+        pytest.skip(f"{MODEL_ID} isn't downloaded")
+    return path
+
+
+@pytest.fixture(scope="module")
+def link(model_path: Path) -> Iterator[RemoteStageLink]:
+    # EXO_REMOTE_STAGE=host:port tests a stage that's already running, e.g. on an iPad;
+    # otherwise the Python reference stage runs here
+    given = os.environ.get("EXO_REMOTE_STAGE")
+    if given:
+        host, _, port_text = given.rpartition(":")
+        connected = RemoteStageLink(host, int(port_text))
+        yield connected
+        connected.close()
+        return
+
+    port = _free_port()
+    stage = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "exo.worker.engines.mlx.remote_stage.server",
+            str(model_path),
+            str(START_LAYER),
+            str(END_LAYER),
+            "--port",
+            str(port),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                connected = RemoteStageLink("127.0.0.1", port)
+                break
+            except ConnectionRefusedError:
+                if time.monotonic() > deadline or stage.poll() is not None:
+                    raise
+                time.sleep(0.2)
+        yield connected
+        connected.close()
+    finally:
+        stage.terminate()
+        stage.wait(timeout=10)
+
+
+def _task(
+    question: str,
+    *,
+    context: str = "",
+    temperature: float = 0.0,
+    seed: int | None = None,
+    max_tokens: int = 24,
+) -> TextGenerationTaskParams:
+    content = f"{context}\n\n{question}" if context else question
+    return TextGenerationTaskParams(
+        model=MODEL_ID,
+        input=[InputMessage(role="user", content=InputMessageContent(content))],
+        max_output_tokens=max_tokens,
+        temperature=temperature,
+        seed=seed,
+        # Read where a stage on another device parts from the whole model
+        logprobs=True,
+        top_logprobs=5,
+    )
+
+
+def _generate(
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    task: TextGenerationTaskParams,
+    prefix_cache: KVPrefixCache,
+    stop_after: int | None = None,
+) -> list[GenerationResponse]:
+    responses: list[GenerationResponse] = []
+    generation = mlx_generate(
+        model=model,
+        tokenizer=tokenizer,
+        task=task,
+        prompt=apply_chat_template(tokenizer, task),
+        kv_prefix_cache=prefix_cache,
+        group=None,
+    )
+    for response in generation:
+        responses.append(response)
+        if response.finish_reason is not None or len(responses) == stop_after:
+            break
+    # What a cancelled request does to the generator
+    generation.close()
+    return responses
+
+
+def _compare(
+    name: str,
+    tokenizer: TokenizerWrapper,
+    expected: list[GenerationResponse],
+    actual: list[GenerationResponse],
+    task: TextGenerationTaskParams,
+    *,
+    other_device: bool,
+) -> str:
+    """Tokens must match. A stage on another GPU rounds differently, so there they may part
+    where the whole model itself was undecided, and only there."""
+    expected_tokens = [response.token for response in expected]
+    actual_tokens = [response.token for response in actual]
+    if actual_tokens == expected_tokens:
+        return f"identical ({len(actual_tokens)} tokens)"
+    first = next(
+        (
+            index
+            for index, (want, got) in enumerate(
+                zip(expected_tokens, actual_tokens, strict=False)
+            )
+            if want != got
+        ),
+        None,
+    )
+    assert first is not None, f"{name}: same tokens, but it stopped at another length"
+    assert other_device, f"{name}: other tokens from token {first}"
+    candidates = {
+        item.token: item.logprob for item in expected[first].top_logprobs or []
+    }
+    chosen = tokenizer.decode([actual_tokens[first]])
+    assert chosen in candidates, (
+        f"{name}: at token {first} the stage chose {chosen!r}, not in the whole model's "
+        f"top {len(candidates)}: {candidates}"
+    )
+    gap = max(candidates.values()) - candidates[chosen]
+    if not task.temperature:
+        assert gap <= TIE_LOGPROB_GAP, (
+            f"{name}: at greedy token {first} the stage chose {chosen!r}, "
+            f"{gap:.4f} below the whole model's choice"
+        )
+    return f"identical for {first} tokens, then a near-tie (logprob gap {gap:.4f})"
+
+
+@pytest.mark.slow
+def test_remote_stage_generates_what_the_whole_model_does(
+    model_path: Path, link: RemoteStageLink
+) -> None:
+    tokenizer = load_tokenizer_for_model_id(MODEL_ID, model_path)
+    whole, _ = load_model(model_path)
+    staged, _ = load_model(model_path)
+    install_remote_stage(staged, link, START_LAYER, END_LAYER)  # pyright: ignore[reportArgumentType]
+    whole_prefix_cache = KVPrefixCache(None)
+    staged_prefix_cache = KVPrefixCache(None)
+    # The Python reference stage runs on this GPU, so its tokens must match exactly
+    other_device = bool(os.environ.get("EXO_REMOTE_STAGE"))
+
+    # (name, task, stop after n tokens, whether the prefix cache must have been used)
+    scenarios: list[tuple[str, TextGenerationTaskParams, int | None, bool]] = [
+        ("short, greedy", _task("What is the capital of France?"), None, False),
+        (
+            "long, miss",
+            _task("How many marbles are in box 12?", context=LONG_CONTEXT),
+            None,
+            False,
+        ),
+        (
+            "long, partial hit",
+            _task("Which boxes hold amber marbles?", context=LONG_CONTEXT),
+            None,
+            True,
+        ),
+        (
+            "long, exact hit",
+            _task("Which boxes hold amber marbles?", context=LONG_CONTEXT),
+            None,
+            True,
+        ),
+        (
+            "long, sampled",
+            _task(
+                "Describe box 40.",
+                context=LONG_CONTEXT,
+                temperature=0.7,
+                seed=3,
+                max_tokens=40,
+            ),
+            None,
+            True,
+        ),
+        (
+            "long, abandoned",
+            _task("List boxes 1 to 30.", context=LONG_CONTEXT),
+            3,
+            True,
+        ),
+        (
+            "long, after abandoned",
+            _task("How many marbles are in box 12?", context=LONG_CONTEXT),
+            None,
+            True,
+        ),
+    ]
+
+    for name, task, stop_after, expect_hit in scenarios:
+        prompt_length = len(
+            encode_prompt(tokenizer, apply_chat_template(tokenizer, task))
+        )
+        forwards_before = len(link.forward_lengths)
+        expected = _generate(whole, tokenizer, task, whole_prefix_cache, stop_after)  # pyright: ignore[reportArgumentType]
+        actual = _generate(staged, tokenizer, task, staged_prefix_cache, stop_after)  # pyright: ignore[reportArgumentType]
+        prefilled = sum(
+            length for length in link.forward_lengths[forwards_before:] if length > 1
+        )
+        outcome = _compare(
+            name, tokenizer, expected, actual, task, other_device=other_device
+        )
+        print(f"{name}: prompt {prompt_length}, stage prefilled {prefilled}: {outcome}")
+        if expect_hit:
+            assert prefilled < prompt_length // 2, (
+                f"{name}: the prefix cache wasn't used"
+            )
+
+    # Every cache the node dropped is gone from the stage too
+    del whole_prefix_cache, staged_prefix_cache
+    gc.collect()
+    mx.clear_cache()
+    assert link.live_caches() == 0
