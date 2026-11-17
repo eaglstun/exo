@@ -58,7 +58,7 @@ class RemoteStageError(RuntimeError):
     pass
 
 
-class RemoteStageLost(RemoteStageError):
+class RemoteStageLostError(RemoteStageError):
     """The connection to the stage broke, or it stopped answering: its app quit or was
     suspended, or the cable came out. Its caches are gone with it."""
 
@@ -75,7 +75,7 @@ class RemoteStageLink:
                 (host, port), timeout=CONNECT_TIMEOUT_SECONDS
             )
         except OSError as error:
-            raise RemoteStageLost(
+            raise RemoteStageLostError(
                 f"can't reach the remote stage at {self.address} ({error}): is its app "
                 f"open, in front, and the device unlocked?"
             ) from error
@@ -156,8 +156,8 @@ class RemoteStageLink:
         except OSError as error:
             raise self._lost(error) from error
 
-    def _lost(self, error: OSError) -> RemoteStageLost:
-        return RemoteStageLost(
+    def _lost(self, error: OSError) -> RemoteStageLostError:
+        return RemoteStageLostError(
             f"the remote stage at {self.address} went away "
             f"({type(error).__name__}: {error})"
         )

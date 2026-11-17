@@ -7,7 +7,10 @@ import threading
 import anyio
 import pytest
 
-from exo.worker.engines.mlx.remote_stage.client import RemoteStageLink, RemoteStageLost
+from exo.worker.engines.mlx.remote_stage.client import (
+    RemoteStageLink,
+    RemoteStageLostError,
+)
 from exo.worker.engines.mlx.remote_stage.presence import watch_stage
 from exo.worker.engines.mlx.remote_stage.protocol import (
     PROTOCOL_VERSION,
@@ -55,7 +58,7 @@ def _free_port() -> int:
 
 
 def test_an_absent_stage_is_lost_plainly():
-    with pytest.raises(RemoteStageLost, match="can't reach the remote stage"):
+    with pytest.raises(RemoteStageLostError, match="can't reach the remote stage"):
         RemoteStageLink("127.0.0.1", _free_port())
 
 
@@ -77,7 +80,7 @@ def test_a_stage_that_quits_mid_request_is_lost_plainly():
     thread = threading.Thread(target=stage)
     thread.start()
     link = RemoteStageLink("127.0.0.1", port)
-    with pytest.raises(RemoteStageLost, match="went away"):
+    with pytest.raises(RemoteStageLostError, match="went away"):
         link.live_caches()
     thread.join()
     listener.close()

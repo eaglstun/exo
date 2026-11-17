@@ -346,7 +346,7 @@ def test_remote_stage_generates_what_the_whole_model_does_in_a_batch(
             assert got == want, f"request {index}: {tokenizer.decode(got)!r}"
     if other_device:
         # Another GPU may part from the whole model at a near-tie; most requests don't
-        assert sum(want == got for want, got in zip(expected, actual)) >= 3
+        assert sum(want == got for want, got in zip(expected, actual, strict=True)) >= 3
 
     gc.collect()
     mx.clear_cache()
