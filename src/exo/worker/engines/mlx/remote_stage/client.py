@@ -51,7 +51,9 @@ CONNECT_TIMEOUT_SECONDS: Final = 10.0
 ANSWER_TIMEOUT_SECONDS: Final = 120.0
 
 # The model families whose layers a stage can run: their blocks are all the same
-STAGE_MODEL_TYPES: Final = frozenset({"llama"})
+# The model types whose layers a stage can run: a Llama layer, or one with Qwen3's norms of
+# each head's queries and keys, and a dense or mixture-of-experts MLP
+STAGE_MODEL_TYPES: Final = frozenset({"llama", "qwen3", "qwen3_moe"})
 
 
 class RemoteStageError(RuntimeError):
@@ -114,7 +116,22 @@ class RemoteStageLink:
         """Send the stage these layers' weights, one layer per frame, yielding how many it
         has after each. Only one layer at a time is read into memory here: from a lazily
         loaded model, the rest never are."""
-        config_json = json.dumps(config)
+        # The config as the stage reads it: each quantized module's own bits, by the stage's
+        # names for them
+        given_quantization = cast(dict[str, object], config.get("quantization") or {})
+        config_json = json.dumps(
+            {
+                **config,
+                "quantization": {
+                    **{
+                        key: value
+                        for key, value in given_quantization.items()
+                        if not isinstance(value, dict)
+                    },
+                    **stage_quantization(layers),
+                },
+            }
+        )
         for index, layer in enumerate(layers):
             weights: dict[str, mx.array] = {
                 f"layers.{index}.{name}": array
@@ -578,19 +595,55 @@ def install_remote_stage(
 
 def rope_frequencies(layer: nn.Module, config: dict[str, object]) -> mx.array:
     """What mx.fast.rope takes as `freqs` for this layer's attention: the model's own when it
-    scales RoPE (llama3), else base ** (2i / dims), which is what `base` alone means."""
+    scales RoPE (llama3), else base ** (2i / dims), which is what `base` alone means. A stage
+    applies RoPE with these and nothing else, so it can't run RoPE that also scales positions
+    or the queries and keys themselves (linear, dynamic, YaRN)."""
     rope = cast(object, getattr(cast(object, getattr(layer, "self_attn")), "rope"))  # noqa: B009
     own: object = getattr(rope, "_freqs", None)
-    if isinstance(own, mx.array):
+    if type(rope).__name__ == "Llama3RoPE" and isinstance(own, mx.array):
         return own.astype(mx.float32)
+    if not (
+        type(rope) is nn.RoPE
+        and not cast(bool, getattr(rope, "traditional"))  # noqa: B009
+        and cast(float, getattr(rope, "scale")) == 1.0  # noqa: B009
+    ):
+        raise RemoteStageError(
+            f"a remote stage can't run this model's RoPE ({type(rope).__name__})"
+        )
     heads = cast(int, config["num_attention_heads"])
     head_dim = cast(
         int, config.get("head_dim") or cast(int, config["hidden_size"]) // heads
     )
-    base = float(cast(float, config.get("rope_theta", 10000.0)))
+    base = float(cast(float, getattr(rope, "base")))  # noqa: B009
     return mx.power(
         mx.array(base), mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim
     )
+
+
+def stage_quantization(layers: Sequence[nn.Module]) -> dict[str, object]:
+    """How each quantized module of these layers is quantized, by the name a stage gives it
+    (layers.<i>.<path>): a checkpoint may quantize some modules at other bits than the rest,
+    such as a mixture of experts' router at 8 bits. Only affine quantization, which is all a
+    stage computes."""
+    quantization: dict[str, object] = {}
+    for index, layer in enumerate(layers):
+        for path, module in cast(
+            list[tuple[str, nn.Module]],
+            layer.named_modules(),  # pyright: ignore[reportUnknownMemberType]
+        ):
+            bits: object = getattr(module, "bits", None)
+            if not isinstance(bits, int):
+                continue
+            mode: object = getattr(module, "mode", "affine")
+            if mode != "affine":
+                raise RemoteStageError(
+                    f"a remote stage can't run {mode} quantization ({path})"
+                )
+            quantization[f"layers.{index}.{path}"] = {
+                "group_size": cast(int, getattr(module, "group_size")),  # noqa: B009
+                "bits": bits,
+            }
+    return quantization
 
 
 def attach_remote_stage(

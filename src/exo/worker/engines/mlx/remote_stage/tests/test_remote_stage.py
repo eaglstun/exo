@@ -1,6 +1,7 @@
-"""A model whose layers 8..15 run on a remote stage generates exactly what the whole model does,
+"""A model whose later layers run on a remote stage generates exactly what the whole model does,
 through exo's own generator and prefix cache: a miss, a partial hit (trim), an exact hit, a
-sampled request and an abandoned one. Needs Llama-3.2-1B-Instruct-4bit downloaded.
+sampled request and an abandoned one. For each model family a stage runs; a model that isn't
+downloaded is skipped.
 """
 
 import gc
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -32,6 +34,7 @@ from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import mlx_generate
 from exo.worker.engines.mlx.remote_stage.client import (
     RemoteStageLink,
+    RemoteStageLostError,
     attach_remote_stage,
 )
 from exo.worker.engines.mlx.types import Model
@@ -40,11 +43,24 @@ from exo.worker.engines.mlx.utils_mlx import (
     load_tokenizer_for_model_id,
 )
 
-MODEL_ID = ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit")
+
+@dataclass(frozen=True)
+class StagedModel:
+    model_id: ModelId
+    # The layers the stage runs: [start_layer, end_layer)
+    start_layer: int
+    end_layer: int
+
+
+MODELS = [
+    StagedModel(ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"), 8, 16),
+    # Qwen3: norms of each head's queries and keys
+    StagedModel(ModelId("mlx-community/Qwen3-0.6B-4bit"), 14, 28),
+    # A mixture of experts: 128 experts, 8 per token
+    StagedModel(ModelId("mlx-community/Qwen3-30B-A3B-4bit"), 40, 48),
+]
 # How close, in logprob, two greedy candidates are when another GPU may pick either
 TIE_LOGPROB_GAP = 0.02
-START_LAYER = 8
-END_LAYER = 16
 
 # Over 1000 tokens, the least prefix mlx_generate reuses from the prefix cache
 LONG_CONTEXT = " ".join(
@@ -59,16 +75,25 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])  # pyright: ignore[reportAny]
 
 
+@pytest.fixture(
+    scope="module",
+    params=MODELS,
+    ids=[model.model_id.split("/")[1] for model in MODELS],
+)
+def staged_model(request: pytest.FixtureRequest) -> StagedModel:
+    return cast(StagedModel, request.param)
+
+
 @pytest.fixture(scope="module")
-def model_path() -> Path:
-    path = resolve_existing_model(MODEL_ID)
+def model_path(staged_model: StagedModel) -> Path:
+    path = resolve_existing_model(staged_model.model_id)
     if path is None:
-        pytest.skip(f"{MODEL_ID} isn't downloaded")
+        pytest.skip(f"{staged_model.model_id} isn't downloaded")
     return path
 
 
 @pytest.fixture(scope="module")
-def link(model_path: Path) -> Iterator[RemoteStageLink]:
+def link() -> Iterator[RemoteStageLink]:
     # EXO_REMOTE_STAGE=host:port tests a stage that's already running, e.g. on an iPad;
     # otherwise the Python reference stage runs here
     given = os.environ.get("EXO_REMOTE_STAGE")
@@ -95,7 +120,7 @@ def link(model_path: Path) -> Iterator[RemoteStageLink]:
             try:
                 connected = RemoteStageLink("127.0.0.1", port)
                 break
-            except ConnectionRefusedError:
+            except RemoteStageLostError:
                 if time.monotonic() > deadline or stage.poll() is not None:
                     raise
                 time.sleep(0.2)
@@ -107,6 +132,7 @@ def link(model_path: Path) -> Iterator[RemoteStageLink]:
 
 
 def _task(
+    model_id: ModelId,
     question: str,
     *,
     context: str = "",
@@ -116,7 +142,7 @@ def _task(
 ) -> TextGenerationTaskParams:
     content = f"{context}\n\n{question}" if context else question
     return TextGenerationTaskParams(
-        model=MODEL_ID,
+        model=model_id,
         input=[InputMessage(role="user", content=InputMessageContent(content))],
         max_output_tokens=max_tokens,
         temperature=temperature,
@@ -198,15 +224,22 @@ def _compare(
 
 @pytest.mark.slow
 def test_remote_stage_generates_what_the_whole_model_does(
-    model_path: Path, link: RemoteStageLink
+    staged_model: StagedModel, model_path: Path, link: RemoteStageLink
 ) -> None:
-    tokenizer = load_tokenizer_for_model_id(MODEL_ID, model_path)
+    model_id = staged_model.model_id
+    tokenizer = load_tokenizer_for_model_id(model_id, model_path)
     whole, _ = load_model(model_path)
     staged, _ = load_model(model_path)
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
-    attach_remote_stage(staged, link, START_LAYER, END_LAYER, config)  # pyright: ignore[reportArgumentType]
+    attach_remote_stage(
+        staged,  # pyright: ignore[reportArgumentType]
+        link,
+        staged_model.start_layer,
+        staged_model.end_layer,
+        config,
+    )
     whole_prefix_cache = KVPrefixCache(None)
     staged_prefix_cache = KVPrefixCache(None)
     # The Python reference stage runs on this GPU, so its tokens must match exactly
@@ -214,28 +247,34 @@ def test_remote_stage_generates_what_the_whole_model_does(
 
     # (name, task, stop after n tokens, whether the prefix cache must have been used)
     scenarios: list[tuple[str, TextGenerationTaskParams, int | None, bool]] = [
-        ("short, greedy", _task("What is the capital of France?"), None, False),
+        (
+            "short, greedy",
+            _task(model_id, "What is the capital of France?"),
+            None,
+            False,
+        ),
         (
             "long, miss",
-            _task("How many marbles are in box 12?", context=LONG_CONTEXT),
+            _task(model_id, "How many marbles are in box 12?", context=LONG_CONTEXT),
             None,
             False,
         ),
         (
             "long, partial hit",
-            _task("Which boxes hold amber marbles?", context=LONG_CONTEXT),
+            _task(model_id, "Which boxes hold amber marbles?", context=LONG_CONTEXT),
             None,
             True,
         ),
         (
             "long, exact hit",
-            _task("Which boxes hold amber marbles?", context=LONG_CONTEXT),
+            _task(model_id, "Which boxes hold amber marbles?", context=LONG_CONTEXT),
             None,
             True,
         ),
         (
             "long, sampled",
             _task(
+                model_id,
                 "Describe box 40.",
                 context=LONG_CONTEXT,
                 temperature=0.7,
@@ -247,13 +286,13 @@ def test_remote_stage_generates_what_the_whole_model_does(
         ),
         (
             "long, abandoned",
-            _task("List boxes 1 to 30.", context=LONG_CONTEXT),
+            _task(model_id, "List boxes 1 to 30.", context=LONG_CONTEXT),
             3,
             True,
         ),
         (
             "long, after abandoned",
-            _task("How many marbles are in box 12?", context=LONG_CONTEXT),
+            _task(model_id, "How many marbles are in box 12?", context=LONG_CONTEXT),
             None,
             True,
         ),
@@ -317,23 +356,30 @@ def _generate_batched(
 
 @pytest.mark.slow
 def test_remote_stage_generates_what_the_whole_model_does_in_a_batch(
-    model_path: Path, link: RemoteStageLink
+    staged_model: StagedModel, model_path: Path, link: RemoteStageLink
 ) -> None:
     """Requests of different lengths join a running batch and leave it at different times:
     the stage merges, extends, filters and extracts its batch caches as mlx-lm does"""
-    tokenizer = load_tokenizer_for_model_id(MODEL_ID, model_path)
+    model_id = staged_model.model_id
+    tokenizer = load_tokenizer_for_model_id(model_id, model_path)
     whole, _ = load_model(model_path)
     staged, _ = load_model(model_path)
     config = cast(
         dict[str, object], json.loads((model_path / "config.json").read_text())
     )
-    attach_remote_stage(staged, link, START_LAYER, END_LAYER, config)  # pyright: ignore[reportArgumentType]
+    attach_remote_stage(
+        staged,  # pyright: ignore[reportArgumentType]
+        link,
+        staged_model.start_layer,
+        staged_model.end_layer,
+        config,
+    )
     schedule = [
-        (0, _task("What is the capital of France?", max_tokens=12)),
-        (0, _task("Name three primary colors.", max_tokens=30)),
-        (3, _task("How many marbles are in box 12?", context=LONG_CONTEXT)),
-        (6, _task("Count from one to ten.", max_tokens=20)),
-        (6, _task("Which boxes hold amber marbles?", context=LONG_CONTEXT)),
+        (0, _task(model_id, "What is the capital of France?", max_tokens=12)),
+        (0, _task(model_id, "Name three primary colors.", max_tokens=30)),
+        (3, _task(model_id, "How many marbles are in box 12?", context=LONG_CONTEXT)),
+        (6, _task(model_id, "Count from one to ten.", max_tokens=20)),
+        (6, _task(model_id, "Which boxes hold amber marbles?", context=LONG_CONTEXT)),
     ]
 
     expected = _generate_batched(whole, tokenizer, schedule)  # pyright: ignore[reportArgumentType]

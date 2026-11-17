@@ -21,9 +21,13 @@ import mlx.core as mx
 import mlx.nn as nn
 import psutil
 from loguru import logger
+from mlx_lm.models import qwen3_moe
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import BatchKVCache, KVCache
-from mlx_lm.models.llama import ModelArgs, TransformerBlock
+from mlx_lm.models.llama import ModelArgs as LlamaArgs
+from mlx_lm.models.llama import TransformerBlock as LlamaBlock
+from mlx_lm.models.qwen3 import ModelArgs as Qwen3Args
+from mlx_lm.models.qwen3 import TransformerBlock as Qwen3Block
 
 from exo.worker.engines.mlx.remote_stage.protocol import (
     PROTOCOL_VERSION,
@@ -39,9 +43,37 @@ DEFAULT_PORT: Final = 5560
 
 @final
 class _Blocks(nn.Module):
-    def __init__(self, blocks: list[TransformerBlock]):
+    def __init__(self, blocks: list[nn.Module]):
         super().__init__()
         self.layers = blocks
+
+
+def _block(
+    config: dict[str, object], weights: dict[str, mx.array], index: int
+) -> nn.Module:
+    """Layer `index` of those sent, as mlx-lm builds it for the config's model type"""
+    match config.get("model_type"):
+        case "llama":
+            return LlamaBlock(LlamaArgs.from_dict(config))  # pyright: ignore[reportUnknownMemberType]
+        case "qwen3":
+            return Qwen3Block(Qwen3Args.from_dict(config))  # pyright: ignore[reportUnknownMemberType]
+        case "qwen3_moe":
+            # Whether a layer has experts follows from its index in the whole model, which
+            # the stage doesn't know: its weights say
+            has_experts = f"layers.{index}.mlp.gate.weight" in weights
+            args = cast(
+                qwen3_moe.ModelArgs,
+                qwen3_moe.ModelArgs.from_dict(  # pyright: ignore[reportUnknownMemberType]
+                    {
+                        **config,
+                        "mlp_only_layers": [] if has_experts else [0],
+                        "decoder_sparse_step": 1,
+                    }
+                ),
+            )
+            return qwen3_moe.Qwen3MoeDecoderLayer(args, layer_idx=0)
+        case other:
+            raise ValueError(f"this stage can't run {other} layers")
 
 
 # One layer's cache of one sequence, or of a batch
@@ -50,7 +82,7 @@ StageCache = KVCache | BatchKVCache
 
 @final
 class StageLayers:
-    """The layers a node loaded, built as mlx-lm's own Llama blocks."""
+    """The layers a node loaded, built as mlx-lm's own blocks."""
 
     def __init__(self, config: dict[str, object], weights: dict[str, mx.array]):
         weights = dict(weights)
@@ -58,15 +90,23 @@ class StageLayers:
         weights.pop("rope_freqs", None)
         layer_count = 1 + max(int(name.split(".")[1]) for name in weights)
         blocks = _Blocks(
-            [TransformerBlock(ModelArgs.from_dict(config)) for _ in range(layer_count)]  # pyright: ignore[reportUnknownMemberType]
+            [_block(config, weights, index) for index in range(layer_count)]
         )
-        quantization = cast(dict[str, int] | None, config.get("quantization"))
-        if quantization is not None:
+        # The node says how it quantized each module (client.stage_quantization)
+        quantization = cast(dict[str, object], config.get("quantization") or {})
+
+        def quantized(path: str, _: nn.Module) -> bool | dict[str, int]:
+            if f"{path}.scales" not in weights:
+                return False
+            own = quantization.get(path)
+            return cast(dict[str, int], own) if isinstance(own, dict) else True
+
+        if quantization:
             nn.quantize(
                 blocks,
-                group_size=quantization["group_size"],
-                bits=quantization["bits"],
-                class_predicate=lambda path, _: f"{path}.scales" in weights,
+                group_size=cast(int, quantization.get("group_size", 64)),
+                bits=cast(int, quantization.get("bits", 4)),
+                class_predicate=quantized,
             )
         blocks.load_weights(list(weights.items()), strict=True)
         mx.eval(blocks.parameters())
