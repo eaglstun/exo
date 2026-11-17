@@ -72,9 +72,9 @@ def _block(
                 ),
             )
             return qwen3_moe.Qwen3MoeDecoderLayer(args, layer_idx=0)
-        case "qwen3_5":
-            # Linear attention or full attention follows from the layer's index in the whole
-            # model too: its weights say. mlx-lm makes layer i linear unless (i + 1) is a
+        case "qwen3_5" | "qwen3_5_moe":
+            # Experts (and a shared expert) when the config has them. Linear attention or full
+            # attention follows from the layer's index in the whole model: its weights say. mlx-lm makes layer i linear unless (i + 1) is a
             # multiple of full_attention_interval
             args = qwen3_5.TextModelArgs.from_dict(config)
             is_linear = f"layers.{index}.linear_attn.A_log" in weights
@@ -123,6 +123,9 @@ class StageLayers:
                 class_predicate=quantized,
             )
         blocks.load_weights(list(weights.items()), strict=True)
+        # As mlx-lm's load_model leaves a model: a module in training mode may compute
+        # otherwise (Qwen3.5's linear attention runs its ops instead of its Metal kernel)
+        blocks.eval()
         mx.eval(blocks.parameters())
         self.layers: Final = blocks.layers
         heads = cast(int, config["num_attention_heads"])

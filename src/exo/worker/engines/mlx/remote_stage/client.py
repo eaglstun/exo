@@ -54,8 +54,11 @@ ANSWER_TIMEOUT_SECONDS: Final = 120.0
 # The model families whose layers a stage can run: their blocks are all the same
 # The model types whose layers a stage can run: a Llama layer, or one with Qwen3's norms of
 # each head's queries and keys, and a dense or mixture-of-experts MLP; and Qwen3.5's, whose
-# linear attention layers keep a recurrent state instead of keys and values
-STAGE_MODEL_TYPES: Final = frozenset({"llama", "qwen3", "qwen3_moe", "qwen3_5"})
+# linear attention layers keep a recurrent state instead of keys and values, dense or with
+# experts and a shared expert
+STAGE_MODEL_TYPES: Final = frozenset(
+    {"llama", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
+)
 
 
 class RemoteStageError(RuntimeError):
@@ -122,7 +125,7 @@ class RemoteStageLink:
         loaded model, the rest never are."""
         # The config as the stage reads it: the text model's, with each quantized module's
         # own bits, by the stage's names for them
-        config = stage_config(config)
+        config = {**stage_config(config), **_expert_routing(layers)}
         given_quantization = cast(dict[str, object], config.get("quantization") or {})
         config_json = json.dumps(
             {
@@ -730,6 +733,22 @@ def stage_config(config: dict[str, object]) -> dict[str, object]:
         "model_type": config.get("model_type"),
         "quantization": config.get("quantization"),
     }
+
+
+def _expert_routing(layers: Sequence[nn.Module]) -> dict[str, object]:
+    """How these layers' experts route, as the model's own modules do it: a config may leave
+    norm_topk_prob out (Qwen3.5's does), and each model's arguments default it differently, so
+    the stage is told rather than left to guess"""
+    for layer in layers:
+        for _, module in cast(
+            list[tuple[str, nn.Module]],
+            layer.named_modules(),  # pyright: ignore[reportUnknownMemberType]
+        ):
+            top_k: object = getattr(module, "top_k", None)
+            normalize: object = getattr(module, "norm_topk_prob", None)
+            if isinstance(top_k, int) and isinstance(normalize, bool):
+                return {"num_experts_per_tok": top_k, "norm_topk_prob": normalize}
+    return {}
 
 
 def stage_quantization(layers: Sequence[nn.Module]) -> dict[str, object]:

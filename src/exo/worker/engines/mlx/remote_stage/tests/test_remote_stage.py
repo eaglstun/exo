@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import cast
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx_lm.models.base import create_attention_mask
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import load_model
 
@@ -29,19 +31,24 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.runner_response import GenerationResponse
-from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt
+from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt, make_kv_cache
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import mlx_generate
 from exo.worker.engines.mlx.remote_stage.client import (
+    RemoteStage,
     RemoteStageLink,
     RemoteStageLostError,
     attach_remote_stage,
+    remote_cache,
+    rope_frequencies,
 )
+from exo.worker.engines.mlx.sharding.pipeline import get_layers
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     load_tokenizer_for_model_id,
 )
+from exo.worker.engines.mlx.vision import get_inner_model
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,8 @@ MODELS = [
     StagedModel(ModelId("mlx-community/Qwen3-30B-A3B-4bit"), 40, 48),
     # Qwen3.5: linear attention layers with a recurrent state, every fourth layer attention
     StagedModel(ModelId("mlx-community/Qwen3.5-2B-MLX-8bit"), 12, 24),
+    # Qwen3.5 with 256 experts, 8 per token, and a shared expert
+    StagedModel(ModelId("mlx-community/Qwen3.5-35B-A3B-4bit"), 34, 40),
 ]
 # How close, in logprob, two greedy candidates are when another GPU may pick either
 TIE_LOGPROB_GAP = 0.02
@@ -352,6 +361,57 @@ def test_remote_stage_generates_what_the_whole_model_does(
     gc.collect()
     mx.clear_cache()
     assert link.live_caches() == 0
+
+
+@pytest.mark.slow
+def test_remote_stage_computes_the_layers_bit_for_bit(
+    staged_model: StagedModel, model_path: Path, link: RemoteStageLink
+) -> None:
+    """The stage's output for a prompt is the model's own layers' output, bit for bit, when
+    it runs on this GPU: matching tokens can hide a stage that computes otherwise (e.g. one
+    whose layers are left in training mode, which runs Qwen3.5's linear attention as ops)"""
+    tokenizer = load_tokenizer_for_model_id(staged_model.model_id, model_path)
+    model, _ = load_model(model_path)
+    config = cast(
+        dict[str, object], json.loads((model_path / "config.json").read_text())
+    )
+    inner = get_inner_model(model)  # pyright: ignore[reportAny]
+    layers = cast(list[nn.Module], list(get_layers(inner)))  # pyright: ignore[reportAny]
+    staged = layers[staged_model.start_layer : staged_model.end_layer]
+    link.load(staged, config, rope_frequencies(staged))
+    prompt = encode_prompt(
+        tokenizer,
+        apply_chat_template(
+            tokenizer,
+            _task(
+                staged_model.model_id,
+                "Which boxes hold amber marbles?",
+                context=LONG_CONTEXT[:600],
+            ),
+        ),
+    )
+    caches = make_kv_cache(model)  # pyright: ignore[reportArgumentType]
+    hidden = cast(nn.Module, inner.embed_tokens)(prompt[None])
+    attention_mask = cast(mx.array | None, create_attention_mask(hidden, None))
+    stage_input = hidden
+    for index, (layer, cache) in enumerate(zip(layers, caches, strict=True)):
+        if index == staged_model.start_layer:
+            stage_input = hidden
+        if index == staged_model.end_layer:
+            break
+        linear = bool(getattr(layer, "is_linear", False))
+        hidden = layer(hidden, None if linear else attention_mask, cache)
+    mx.eval(hidden)
+    stage_output = RemoteStage(link, 0, len(staged))(
+        stage_input, None, remote_cache(link)
+    )
+    if os.environ.get("EXO_REMOTE_STAGE"):
+        difference = mx.abs(
+            stage_output.astype(mx.float32) - hidden.astype(mx.float32)
+        ).max()
+        print(f"largest difference on the other device: {difference.item()}")
+        return
+    assert mx.array_equal(stage_output, hidden).item()
 
 
 def _generate_batched(
