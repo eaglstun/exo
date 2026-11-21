@@ -69,6 +69,8 @@ MODELS = [
     StagedModel(ModelId("mlx-community/Qwen3-30B-A3B-4bit"), 40, 48),
     # Qwen3.5: linear attention layers with a recurrent state, every fourth layer attention
     StagedModel(ModelId("mlx-community/Qwen3.5-2B-MLX-8bit"), 12, 24),
+    # Unquantized (bf16): a stage computes plain matmuls where it has no scales
+    StagedModel(ModelId("mlx-community/Qwen3.5-0.8B-MLX-bf16"), 12, 24),
     # Qwen3.5 with 256 experts, 8 per token, and a shared expert
     StagedModel(ModelId("mlx-community/Qwen3.5-35B-A3B-4bit"), 34, 40),
     # Nemotron-H: Mamba-2, attention without RoPE and MLP blocks, only the first two with a
