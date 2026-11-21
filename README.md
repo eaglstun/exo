@@ -28,6 +28,7 @@ exo connects all your devices into an AI cluster. Not only does exo enable runni
 - **MLX Support**: exo uses [MLX](https://github.com/ml-explore/mlx) as an inference backend and [MLX distributed](https://ml-explore.github.io/mlx/build/html/usage/distributed.html) for distributed communication.
 - **Multiple API Compatibility**: Compatible with OpenAI Chat Completions API, Claude Messages API, OpenAI Responses API, and Ollama API - use your existing tools and clients.
 - **Custom Model Support**: Load custom models from HuggingFace hub to expand the range of available models.
+- **Remote Stages**: A node can hand a range of its layers to an attached device, such as an iPad over USB, that runs them with its own KV caches. See [Remote Stages](#remote-stages).
 
 ## Dashboard
 
@@ -238,6 +239,15 @@ This starts the exo dashboard and API at http://localhost:52415/
 
 *Please view the section on RDMA to enable this feature on MacOS >=26.2!*
 
+**macOS 27:** dyld rejects the Rust bindings (`exo_rs`) when they are built against the macOS 27 SDK, and exo fails to import them with `mis-aligned LINKEDIT string pool`. Build against the 26.5 SDK instead:
+
+```bash
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+  uv sync --extra mlx --all-packages --inexact --reinstall-package exo-rs
+```
+
+After that, run exo with `uv run --no-sync exo`. A plain `uv run` or `uv sync` rebuilds the bindings against the default SDK, and a `uv sync` without `--extra mlx --all-packages --inexact` also uninstalls MLX and the other optional packages.
+
 
 ### Run from Source (Linux)
 
@@ -356,6 +366,41 @@ After that, RDMA will be enabled in macOS and exo will take care of the rest.
 
 ---
 
+### Remote Stages
+
+A remote stage is a device that runs a contiguous range of a node's layers, KV caches and recurrent state included, for example an iPad attached over USB-C. The node sends the stage its layers when it loads a model, then streams hidden states to it on every forward pass. The rest of exo (prefix cache, batching, sampling) runs unchanged.
+
+`src/exo/worker/engines/mlx/remote_stage/server.py` is a Python reference stage, and any other stage implementation should match its behavior:
+
+```bash
+# On the device that runs the layers (any machine with MLX)
+uv run --no-sync python -m exo.worker.engines.mlx.remote_stage.server --host 0.0.0.0 --port 5560
+```
+
+There are two ways to attach a stage:
+
+- **Attached to a node.** The node keeps its share of the model and hands part of it to the stage:
+
+  ```bash
+  EXO_REMOTE_STAGE=169.254.154.199:5560 uv run exo
+  ```
+
+  `EXO_REMOTE_STAGE_LAYERS` sets how many layers the stage takes (default: half of the node's).
+
+- **As its own node (proxy).** A second node on the same machine stands in for the device. It reports the device's memory as its own, so placement gives it as many layers as the device can hold, and every layer placed on it runs on the stage. The proxy keeps only the embedding, the head, the tokenizer and sampling. Give it its own `EXO_HOME`, `--api-port` and `--zenoh-port`:
+
+  ```bash
+  EXO_HOME=.exo-proxy EXO_DEFAULT_MODELS_DIR=$HOME/.exo/models \
+  EXO_REMOTE_STAGE=169.254.154.199:5560 EXO_REMOTE_STAGE_PROXY=1 \
+    uv run exo --api-port 52416 --zenoh-port 52417
+  ```
+
+  A proxy waits for its stage before it joins the cluster. It leaves after 30 seconds without hearing from the stage and rejoins when the stage answers again.
+
+Stages run Llama, Qwen3, Qwen3 MoE, Qwen3.5 (linear attention), Qwen3.5 MoE and Nemotron-H (Mamba-2, attention, MLP and MoE layers), quantized or unquantized. A stage applies plain RoPE and Llama 3's frequency scaling. A node refuses to hand layers to a stage when the model uses traditional RoPE, position scaling (linear or dynamic) or YaRN.
+
+---
+
 ## Environment Variables
 
 exo supports several environment variables for configuration:
@@ -370,6 +415,9 @@ exo supports several environment variables for configuration:
 | `EXO_ZENOH_NAMESPACE` | Custom namespace for cluster isolation (same as `--namespace`) | exo version |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
+| `EXO_REMOTE_STAGE` | `host:port` of a [remote stage](#remote-stages) this node hands part of its layers to | None |
+| `EXO_REMOTE_STAGE_LAYERS` | How many layers the remote stage takes | Half of the node's |
+| `EXO_REMOTE_STAGE_PROXY` | `1`: this node stands in for its remote stage's device, and all its layers run there | None |
 
 **Example usage:**
 
@@ -631,7 +679,7 @@ The tool outputs performance metrics including prompt tokens per second (prompt_
 
 ## Hardware Accelerator Support
 
-On macOS, exo uses the GPU. On Linux, exo currently runs on CPU. We are working on extending hardware accelerator support. If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
+On macOS, exo uses the GPU. On Linux, exo currently runs on CPU. On the CPU backend a node computes in float32, because MLX's half-precision quantized matmuls run 8x (bfloat16) to 40x (float16) slower there. It still exchanges hidden states with other nodes in the checkpoint's dtype, so a CPU node can share a pipeline with GPU nodes, for example a Raspberry Pi 5 with a Mac. We are working on extending hardware accelerator support. If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
 
 ---
 

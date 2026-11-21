@@ -43,6 +43,15 @@ uv run ruff check
 nix fmt
 ```
 
+**macOS 27:** dyld rejects `exo_rs` built against the macOS 27 SDK ("mis-aligned LINKEDIT string pool"), and `uv run` rebuilds it that way whenever it syncs. Build it once against the 26.5 SDK, then use `uv run --no-sync` for every command above:
+
+```bash
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+  uv sync --extra mlx --all-packages --inexact --reinstall-package exo-rs
+```
+
+Without `--extra mlx --all-packages --inexact`, `uv sync` also uninstalls MLX, mlx-lm, torch and uvicorn. If tests that spawn subprocesses hang with children that die at startup, check `python -c "import exo_rs"` first.
+
 ## Pre-Commit Checks (REQUIRED)
 
 **IMPORTANT: Always run these checks before committing code. CI will fail if these don't pass.**
@@ -100,6 +109,19 @@ The system uses event sourcing for state management:
   - `tasks.py`: Task types for worker execution
   - `state.py`: Cluster state model
 
+### Remote Stages
+`src/exo/worker/engines/mlx/remote_stage/` lets a node hand a contiguous range of its layers to another device (e.g. an iPad over USB) over a TCP protocol. See the README's Remote Stages section for how to run it.
+- `protocol.py`: frames and `PROTOCOL_VERSION`. Bump it whenever a frame changes, and bump the iPad's Swift stage with it: a node refuses a stage whose `welcome` carries another version
+- `client.py`: the node's side. A module stands in for the layer range, and `RemoteKVCache` / `RemoteBatchKVCache` / `RemoteSnapshotCache` turn every cache operation exo and mlx-lm use (`offset`, `trim`, `deepcopy`, `nbytes`, `state`, `make_mask`) into a stage operation, so the rest of exo runs unchanged
+- `server.py`: the Python reference stage. Other stage implementations follow it, so change it first and keep it computing exactly what mlx-lm computes
+- `presence.py`: a proxy node (`EXO_REMOTE_STAGE_PROXY=1`) leaves the cluster after 30 s of stage silence and rejoins when the stage answers
+- `settings.py`: the `EXO_REMOTE_STAGE*` environment variables, read without importing MLX
+
+To add a model family: build its blocks in `server.py`, send whatever config the stage needs from `client.py`, and add a checkpoint to `MODELS` in `tests/test_remote_stage.py`.
+
+### CPU Backend
+On MLX's CPU backend a rank computes in float32 (`upcast_for_cpu` in `utils_mlx.py`): half-precision quantized matmuls are 8–40x slower there. Its pipeline neighbours may run on a GPU in the checkpoint's half dtype, and `recv_like` sizes a receive from its template, so every rank sends and receives hidden states in the checkpoint's dtype (`set_pipeline_wire_dtype` in `sharding/pipeline.py`). Don't send hidden states in a rank's compute dtype.
+
 ### Rust Components
 Rust code in `rust/` provides:
 - `networking`: zenoh networking (gossipsub, peer discovery)
@@ -123,6 +145,21 @@ From .cursorrules:
 ## Testing
 
 Tests use pytest-asyncio with `asyncio_mode = "auto"`. Tests are in `tests/` subdirectories alongside the code they test. The `EXO_TESTS=1` env var is set during tests.
+
+The remote-stage tests that load real models are marked `slow`, run once per checkpoint in `MODELS`, and skip any checkpoint that isn't downloaded:
+
+```bash
+# Against a Python stage the test starts on this machine
+uv run pytest -m slow src/exo/worker/engines/mlx/remote_stage
+
+# Against a stage that's already running, e.g. on an iPad
+EXO_REMOTE_STAGE=169.254.154.199:5560 uv run pytest -m slow src/exo/worker/engines/mlx/remote_stage
+
+# One model only
+uv run pytest -m slow src/exo/worker/engines/mlx/remote_stage -k "Qwen3.5-0.8B"
+```
+
+`test_remote_stage_computes_the_layers_bit_for_bit` requires the stage's output to match the model's own layers bit for bit when both run on this GPU (matching tokens can hide a stage that computes differently). Generation tests across two different GPUs accept a different token only where the top two candidates are within `TIE_LOGPROB_GAP`.
 
 ## Dashboard UI Testing & Screenshots
 
