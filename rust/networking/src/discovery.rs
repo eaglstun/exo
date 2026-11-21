@@ -50,6 +50,8 @@ pub struct Discovery {
     recent_nonces: Mutex<RecentNonces>,
     /// the port of the service we are doing discovery for - transmitted to peers
     listen_port: u16,
+    /// The port every node's discovery socket shares, where replies to a Hello go
+    discovery_port: u16,
     zid: ZenohId,
     tick: Interval,
     /// When we last warned that no Hello could be sent; `None` while sending works.
@@ -98,6 +100,7 @@ impl Discovery {
                         if iface
                             .ipv6_ips()
                             .all(|addr| addr.is_loopback() || addr.is_unspecified())
+                            || is_tunnel(&iface.name)
                         {
                             continue;
                         }
@@ -145,6 +148,7 @@ impl Discovery {
             ifaces,
             recent_nonces: Mutex::new(RecentNonces::default()),
             listen_port,
+            discovery_port,
             zid,
             tick: {
                 // After a stall, announce once rather than in a burst of missed ticks
@@ -258,9 +262,10 @@ impl Discovery {
                 // One attempt only: retrying here would stall this loop (and with it our own
                 // announcements and every other reply), and the peer says Hello again every
                 // second anyway.
-                match self.sock.send_to(&reply, addr).await {
-                    Ok(sent) => trace!("sent {sent} bytes to {addr}"),
-                    Err(e) => debug!("send to {addr} failed: {e}"),
+                let reply_to = self.reply_address(addr);
+                match self.sock.send_to(&reply, reply_to).await {
+                    Ok(sent) => trace!("sent {sent} bytes to {reply_to}"),
+                    Err(e) => debug!("send to {reply_to} failed: {e}"),
                 }
                 Ok(None)
             }
@@ -320,6 +325,26 @@ impl Discovery {
         }
     }
 
+    /// Where a reply to a Hello from `hello_from` goes: the multicast group, on the interface
+    /// the Hello came in on. Every exo on a machine shares the discovery port, and a unicast
+    /// reply to it reaches only one of them, so with two nodes on one machine (a proxy node
+    /// beside a full one) the other could never discover anyone. Over multicast each of them
+    /// hears it, and only the one whose nonce it carries takes it. The testkit's relay
+    /// (`ANNOUNCE_TO_ENV`) and a Hello without an interface still get a unicast reply.
+    fn reply_address(&self, hello_from: SocketAddr) -> SocketAddr {
+        match hello_from {
+            SocketAddr::V6(from) if self.announce_to.is_none() && from.scope_id() != 0 => {
+                SocketAddr::V6(SocketAddrV6::new(
+                    GROUP,
+                    self.discovery_port,
+                    0,
+                    from.scope_id(),
+                ))
+            }
+            _ => hello_from,
+        }
+    }
+
     async fn announce(&self) -> io::Result<()> {
         let nonce = rand::random();
         self.recent_nonces.lock().push(nonce);
@@ -364,6 +389,14 @@ impl Discovery {
         }
         Ok(())
     }
+}
+
+/// A macOS tunnel (utun: VPNs, Tailscale, iCloud Private Relay). Multicast doesn't cross one,
+/// so no peer is found there, but two nodes on one machine hear each other's Hellos on it
+/// (multicast loops back on every joined interface) and then dial an address no one answers
+/// on, while zenoh holds back other dials to that peer.
+fn is_tunnel(name: &str) -> bool {
+    name.starts_with("utun")
 }
 
 fn announce_to_from_env() -> Option<Vec<SocketAddrV6>> {

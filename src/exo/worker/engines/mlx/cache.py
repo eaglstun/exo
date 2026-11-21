@@ -1,5 +1,6 @@
 import gc
 import os
+from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, cast
 
@@ -551,10 +552,21 @@ def get_available_memory() -> Memory:
     return Memory.from_bytes(mem)
 
 
+# Other devices holding this node's caches (a remote stage): each says how full it is, 0 to 1
+_memory_pressure_sources: list[Callable[[], float]] = []
+
+
+def add_memory_pressure_source(source: Callable[[], float]) -> None:
+    """Count another device's memory in this node's memory pressure: a remote stage keeps
+    the KV caches of this node's prefix cache entries too"""
+    _memory_pressure_sources.append(source)
+
+
 def get_memory_used_percentage() -> float:
     mem = psutil.virtual_memory()
     # percent is 0-100
-    return float(mem.percent / 100)
+    local = float(mem.percent / 100)
+    return max([local, *(source() for source in _memory_pressure_sources)])
 
 
 def make_kv_cache(

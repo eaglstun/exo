@@ -29,7 +29,6 @@ from exo.testkit.cluster import (
     Cluster,
     HarnessError,
     HarnessTimeoutError,
-    NoPlacementError,
     process_is_running,
 )
 from exo.testkit.stub.config import StubConfig
@@ -56,20 +55,6 @@ def _setup(what: str) -> Iterator[None]:
         yield
     except (HarnessError, AssertionError) as error:
         raise ScenarioSetupError(f"setup ({what}) failed: {error}") from error
-
-
-class BeyondTheKnownFailureError(Exception):
-    """A failure past the point a scenario's xfail is about (not the failure it expects)."""
-
-
-@contextlib.contextmanager
-def _beyond_the_known_failure(what: str) -> Iterator[None]:
-    """Steps an xfail's known failure would have stopped before: once that failure is fixed,
-    anything that goes wrong here is a new failure, never the expected one."""
-    try:
-        yield
-    except (HarnessError, AssertionError) as error:
-        raise BeyondTheKnownFailureError(f"{what} failed: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -781,25 +766,13 @@ def test_a_20s_cut_keeps_the_model(make_cluster: MakeCluster) -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    # Only the refused placement: a placement that then fails to serve is another failure
-    # (raised as BeyondTheKnownFailureError)
-    raises=AssertionError,
-    reason="Found by this harness: each node probes its peers' /node_id at its own "
-    "--api-port, so nodes started with different API ports never get a topology edge, and "
-    "every placement across them is refused",
-)
 def test_nodes_with_different_api_ports_can_run_a_model_together(
     make_cluster: MakeCluster,
 ) -> None:
+    """Each node advertises its API port and its peers probe it there, as two nodes on one
+    machine (a proxy node beside a full one) need"""
     with _setup("two nodes, each with its own API port"):
-        cluster = make_cluster(2, probe_own_port=True, require_edges=False)
-    try:
-        cluster.preview(on=(0, 1))
-    except NoPlacementError as error:
-        # No edges between the two, so no ring placement across them
-        raise AssertionError(str(error)) from error
-    with _beyond_the_known_failure("serving across the two once placed"):
-        cluster.launch(on=(0, 1), timeout=30)
-        _ok(cluster.chat("across two API ports", via=0, timeout=30))
+        cluster = make_cluster(2, probe_own_port=True)
+    cluster.preview(on=(0, 1))
+    cluster.launch(on=(0, 1), timeout=30)
+    _ok(cluster.chat("across two API ports", via=0, timeout=30))

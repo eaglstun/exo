@@ -386,9 +386,10 @@ def get_mlx_ring_hosts_by_node(
 ) -> dict[NodeId, list[Host]]:
     """Generate per-node host lists for MLX ring backend.
 
-    Each node gets a list where:
-    - Self position: Host(ip="0.0.0.0", port=ephemeral_port)
-    - Left/right neighbors: actual connection IPs
+    Rank r listens on ephemeral_port + r: nodes sharing a machine (a proxy node beside a full
+    one) each need their own port. Each node gets a list where:
+    - Self position: Host(ip="0.0.0.0", port=ephemeral_port + rank)
+    - Left/right neighbors: actual connection IPs, at their ranks' ports
     - Non-neighbors: Host(ip="198.51.100.1", port=0) placeholder (RFC 5737 TEST-NET-2)
     """
     world_size = len(selected_cycle)
@@ -405,7 +406,7 @@ def get_mlx_ring_hosts_by_node(
 
         for idx, other_node_id in enumerate(selected_cycle):
             if idx == rank:
-                hosts_for_node.append(Host(ip="0.0.0.0", port=ephemeral_port))
+                hosts_for_node.append(Host(ip="0.0.0.0", port=ephemeral_port + rank))
                 continue
 
             if idx not in {left_rank, right_rank}:
@@ -421,7 +422,7 @@ def get_mlx_ring_hosts_by_node(
                     "MLX ring backend requires connectivity between neighbouring nodes"
                 )
 
-            hosts_for_node.append(Host(ip=connection_ip, port=ephemeral_port))
+            hosts_for_node.append(Host(ip=connection_ip, port=ephemeral_port + idx))
 
         hosts_by_node[node_id] = hosts_for_node
 

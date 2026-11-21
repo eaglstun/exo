@@ -75,7 +75,9 @@ from exo.shared.types.worker.shards import (
 from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
+    with_loading_progress,
 )
+from exo.worker.engines.mlx.sharding.blocks import LayerCallable
 from exo.worker.engines.mlx.sharding.pipeline import (
     get_inner_model,
     get_layers,
@@ -246,16 +248,23 @@ def load_mlx_items(
         try:
             inner = get_inner_model(model)
             layers = get_layers(inner)
-            total = len(layers)
-            for i, layer in enumerate(layers):
-                mx.eval(layer)  # type: ignore
-                yield ModelLoadingResponse(layers_loaded=i, total=total)
+            if _is_stage_proxy():
+                # A proxy node: its layers run on the stage's device, never here
+                inner.layers = yield from _hand_layers_to_stage(
+                    model, list(layers), model_path
+                )
+            else:
+                total = len(layers)
+                for i, layer in enumerate(layers):
+                    mx.eval(layer)  # type: ignore
+                    yield ModelLoadingResponse(layers_loaded=i, total=total)
         except ValueError as e:
             logger.opt(exception=e).debug(
                 "Model architecture doesn't support layer-by-layer progress tracking",
             )
         mx.eval(model)
         run_post_load(model, model_path)
+        _attach_configured_remote_stage(model, model_path)
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
@@ -322,6 +331,36 @@ def upcast_for_cpu(model: nn.Module) -> mx.Dtype | None:
     return checkpoint_dtype
 
 
+def _is_stage_proxy() -> bool:
+    # Imported here: the remote stage's client imports modules that import this one
+    from exo.worker.engines.mlx.remote_stage.settings import is_stage_proxy
+
+    return is_stage_proxy()
+
+
+def _hand_layers_to_stage(
+    model: nn.Module, layers: list[LayerCallable], model_path: Path
+) -> Generator[ModelLoadingResponse, None, list[LayerCallable]]:
+    """A proxy node's layers, sent to its stage, with loading progress"""
+    from exo.worker.engines.mlx.remote_stage.client import hand_layers_to_stage
+
+    return (
+        yield from with_loading_progress(
+            hand_layers_to_stage(model, layers, model_path)
+        )
+    )
+
+
+def _attach_configured_remote_stage(model: nn.Module, model_path: Path) -> None:
+    """Hand part of this node's layers to EXO_REMOTE_STAGE, if set (see remote_stage)."""
+    # Imported here: the remote stage's client imports modules that import this one
+    from exo.worker.engines.mlx.remote_stage.client import (
+        attach_configured_remote_stage,
+    )
+
+    attach_configured_remote_stage(cast(Model, model), model_path)
+
+
 def run_post_load(model: nn.Module, model_path: Path) -> None:
     """Run the model family's post-load step, if it has one."""
     architecture = architecture_for_model(model)
@@ -379,6 +418,7 @@ def shard_and_load(
     # TODO: Do we need this?
     mx.eval(model)
     run_post_load(model, model_path)
+    _attach_configured_remote_stage(model, model_path)
 
     logger.debug("SHARDED")
     logger.debug(model)

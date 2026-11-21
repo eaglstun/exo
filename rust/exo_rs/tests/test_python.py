@@ -13,7 +13,15 @@ from exo_rs import (
 @pytest.mark.asyncio
 async def test_sleep_on_multiple_items() -> None:
     print("PYTHON: starting handle")
-    h = NetworkingHandle.new(os.urandom(16).hex().lstrip("0"), 52414, 52413)
+    h = NetworkingHandle.new(
+        os.urandom(16).hex().lstrip("0"),
+        f"test-{os.getpid()}",
+        1,
+        "test",
+        None,
+        52414,
+        52413,
+    )
     print("PYTHON: handle started")
 
     rt = asyncio.create_task(_await_recv(h))

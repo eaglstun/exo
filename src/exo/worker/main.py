@@ -42,6 +42,7 @@ from exo.shared.types.events import (
     TopologyEdgeDeleted,
 )
 from exo.shared.types.multiaddr import Multiaddr
+from exo.shared.types.profiling import DEFAULT_API_PORT
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
     CreateRunner,
@@ -157,7 +158,7 @@ class Worker:
         logger.info("Starting Worker")
 
         info_send, info_recv = channel[GatheredInfo]()
-        info_gatherer: InfoGatherer = InfoGatherer(info_send)
+        info_gatherer: InfoGatherer = InfoGatherer(info_send, api_port=self.api_port)
 
         try:
             async with self._tg as tg:
@@ -544,6 +545,11 @@ class Worker:
                     )
                 del self.runners[runner_id]
 
+    def _api_port_of(self, node_id: NodeId) -> int:
+        """The port `node_id` serves its API on, as it advertises it"""
+        network = self.state.node_network.get(node_id)
+        return network.api_port if network is not None else DEFAULT_API_PORT
+
     async def _poll_connection_updates(self):
         while True:
             edges = set(
@@ -559,12 +565,13 @@ class Worker:
                 if ip in conns[nid]:
                     continue
                 conns[nid].add(ip)
+                sink_api_port = self._api_port_of(nid)
                 edge = SocketConnection(
                     # nonsense multiaddr
-                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/{self.api_port}")
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/{sink_api_port}")
                     if "." in ip
                     # nonsense multiaddr
-                    else Multiaddr(address=f"/ip6/{ip}/tcp/{self.api_port}"),
+                    else Multiaddr(address=f"/ip6/{ip}/tcp/{sink_api_port}"),
                 )
                 if edge not in edges:
                     logger.debug(f"ping discovered {edge=}")
@@ -578,7 +585,7 @@ class Worker:
                 if not isinstance(conn.edge, SocketConnection):
                     continue
                 # ignore mDNS discovered connections
-                if conn.edge.sink_multiaddr.port != self.api_port:
+                if conn.edge.sink_multiaddr.port != self._api_port_of(conn.sink):
                     continue
                 if (
                     conn.sink not in conns

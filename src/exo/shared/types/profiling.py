@@ -1,7 +1,7 @@
 import shutil
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, Self
+from typing import Final, Literal, Self
 
 import psutil
 
@@ -99,10 +99,17 @@ class NodeIdentity(FrozenModel):
     os_build_version: str = "Unknown"
 
 
+# Where a node serves its API unless started with --api-port
+DEFAULT_API_PORT: Final = 52415
+
+
 class NodeNetworkInfo(FrozenModel):
     """Network interface information for a node."""
 
     interfaces: Sequence[NetworkInterfaceInfo] = []
+    # The port its API listens on: its peers probe /node_id and deliver requests there.
+    # Nodes sharing a machine (a proxy node beside a full one) each have their own.
+    api_port: int = DEFAULT_API_PORT
 
 
 class NodeThunderboltInfo(FrozenModel):

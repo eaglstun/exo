@@ -85,7 +85,10 @@ async def check_reachable(
     node_network: Mapping[NodeId, NodeNetworkInfo],
     api_port: int,
 ) -> AsyncGenerator[tuple[str, NodeId], None]:
-    """Yield (ip, node_id) pairs as reachability probes complete."""
+    """Yield (ip, node_id) pairs as reachability probes complete. Each peer is probed at the
+    API port it advertises; `api_port`, this node's own, is unused (kept for exo.testkit's
+    stand-in)."""
+    del api_port
 
     send, recv = channel[tuple[str, NodeId]]()
 
@@ -105,7 +108,13 @@ async def check_reachable(
     ) -> None:
         async with send:
             out: defaultdict[NodeId, set[str]] = defaultdict(set)
-            await check_reachability(target_ip, expected_node_id, out, client, api_port)
+            await check_reachability(
+                target_ip,
+                expected_node_id,
+                out,
+                client,
+                node_network[expected_node_id].api_port,
+            )
             if expected_node_id in out:
                 await send.send((target_ip, expected_node_id))
 
