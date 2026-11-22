@@ -836,6 +836,9 @@ def _stage_config(model_path: Path) -> dict[str, object]:
         raise RemoteStageError(
             f"a remote stage can't run {config.get('model_type')} layers yet"
         )
+    # config.json names the architecture, not the checkpoint: tell the stage which model
+    # it runs (exo's model directory, e.g. mlx-community--Llama-3.2-1B-Instruct-4bit)
+    config["exo_model_id"] = model_path.name.replace("--", "/", 1)
     return config
 
 
